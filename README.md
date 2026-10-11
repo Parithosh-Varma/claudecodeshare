@@ -2,7 +2,12 @@
 
 Self-hosted relay to access **your own** dev machines remotely (phone / browser / second laptop), with **independent, revocable, expiring guest links** for pair programming.
 
-**Live**: landing page — https://second-seat.pages.dev (also https://second-seat.parithosh.workers.dev) · cloud relay — https://second-seat-relay.parithosh.workers.dev
+**Live**: landing page — https://second-seat.pages.dev (also https://second-seat.parithosh.workers.dev) · cloud relay — https://second-seat-relay.parithosh.workers.dev · console — https://second-seat-console.pages.dev
+
+> This repo is the open-source core (agent, node relay, CLI, landing).
+> The paid hosted service (cloud relay worker, dashboard UI) lives in the
+> private `second-seat-cloud` repo. Edit those there; they run from disk
+> here for local dev and deploys.
 
 PandaNpc-style sharing, reframed for compliant use: **1 seat = 1 human**. Each collaborator uses their **own** model quota unless your provider's team/enterprise plan explicitly allows pooling. Works with any terminal tool — `opencode` + your own API keys, local shells, and your own licensed Claude Code / Codex sessions.
 
