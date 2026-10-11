@@ -4,6 +4,7 @@
 // opencode / claude code render correctly); revoke/expiry kills only that PTY.
 import fs from "node:fs";
 import net from "node:net";
+import { execSync } from "node:child_process";
 import path from "node:path";
 import WebSocket from "ws";
 import * as pty from "node-pty";
@@ -195,10 +196,37 @@ function touch(id) {
   if (s) s.lastActive = Date.now();
 }
 
+// The sandbox outlives any one guest, so opencode's history in it would too:
+// the next person to claim this link sees the previous person's sessions in
+// the tabs. Clear it whenever a shell is actually spawned — a reconnect reuses
+// the live PTY above and is deliberately left alone. The opencode service
+// holds the DB open, so stop it first or the delete silently has no effect.
+function resetGuestHistory() {
+  try {
+    const svcFile = path.join(sandbox, ".config", "opencode", "service.json");
+    let port = null;
+    try { port = JSON.parse(fs.readFileSync(svcFile, "utf8")).port; } catch { /* nothing preseeded */ }
+    if (port) {
+      const pids = execSync(`lsof -nP -iTCP:${port} -sTCP:LISTEN -t 2>/dev/null || true`, { encoding: "utf8" }).trim();
+      for (const line of pids.split("\n")) {
+        const pid = parseInt(line, 10);
+        // Only ever kill a listener on OUR port, never ourselves.
+        if (pid && pid !== process.pid) { try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ } }
+      }
+    }
+    const data = path.join(sandbox, ".local", "share", "opencode");
+    if (fs.existsSync(data)) {
+      fs.rmSync(data, { recursive: true, force: true });
+      console.log("[agent] cleared guest opencode history — fresh for this guest");
+    }
+  } catch (e) { console.warn("[agent] could not clear opencode history:", e.message); }
+}
+
 function ensureSession(id, cols = 80, rows = 24) {
   const existing = sessions.get(id);
   if (existing) { touch(id); return existing.pty; }
   console.log(`[agent] new session for ${id} (cwd=${sandbox}, shell=${SHELL})`);
+  resetGuestHistory();
   let p;
   try {
     p = pty.spawn(spawnFile, spawnArgs, {
