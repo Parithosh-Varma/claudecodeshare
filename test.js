@@ -160,6 +160,7 @@ try {
   try { globalThis.__ws2?.close(); } catch {}
   try { agent?.kill(); } catch {}
   try { server?.kill(); } catch {}
+  try { if (typeof conn !== "undefined" && conn?.id) fs.rmSync(path.join("sandbox", conn.id), { recursive: true, force: true }); } catch {}
 }
 console.log(results.map((r) => r.join(" | ")).join("\n"));
 process.exit(process.exitCode || 0);

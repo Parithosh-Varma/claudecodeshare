@@ -27,7 +27,8 @@ const flag = (n, d) => {
 };
 const REPO = args.find((a) => !a.startsWith("--") && a.includes("/")) || null;
 const REMOTE_ARG = flag("--remote", null);
-if (!REPO && !REMOTE_ARG) {
+const PREVIEW_ONLY = args.includes("--preview");
+if (!REPO && !REMOTE_ARG && !PREVIEW_ONLY) {
   console.error("usage: node publish.js <owner/repo> | --remote <url> [--connection c_...] [--branch main] [--create] [--watch] [--interval 15] [--no-push] [--no-auth] [--status-file path]");
   process.exit(1);
 }
@@ -89,7 +90,7 @@ if (!PREVIEW && !NO_AUTH && GH_ENV === null) {
   if (r.status !== 0 || !ghStatus(GH_ENV)) { console.error("GitHub login failed"); process.exit(1); }
   console.log("logged in via gh (token kept in OS keyring, not on disk)");
 }
-const me = NO_AUTH ? "claudecodeshare" : (gh(["api", "user", "-q", ".login"]).stdout.trim() || "claudecodeshare");
+const me = (NO_AUTH || PREVIEW) ? "claudecodeshare" : (gh(["api", "user", "-q", ".login"]).stdout.trim() || "claudecodeshare");
 
 // ---- sandboxes to back up ----
 const sandboxRoot = path.join(__dirname, "sandbox");
@@ -107,7 +108,7 @@ if (CONNECTION) {
 if (sandboxes.length === 0) { console.error("nothing to back up"); process.exit(1); }
 
 // ---- staging clone (the single cloud folder) ----
-const stagingName = ((REPO || REMOTE_ARG).replace(/[^A-Za-z0-9_.-]+/g, "_")).slice(0, 80);
+const stagingName = ((REPO || REMOTE_ARG || "preview").replace(/[^A-Za-z0-9_.-]+/g, "_")).slice(0, 80);
 const cloudRoot = path.join(__dirname, ".cloud");
 const staging = path.join(cloudRoot, stagingName);
 fs.mkdirSync(cloudRoot, { recursive: true });
