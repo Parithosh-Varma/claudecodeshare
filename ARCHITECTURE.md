@@ -7,6 +7,8 @@ everything you need to self-host is open.
 ┌──────────── public: second-seat (this repo, MIT) ────────────┐
 │  apps (runtime)              CLI              site            │
 │  ├─ server.js  relay+API     ├─ bin/second-seat.js  entry    │
+│  │   (serves dashboard or    │   (share|agent|publish|server │
+│  │    headless status page)  │    subcommands, global-ready) │
 │  ├─ agent.js   PTY executor  ├─ share.js      serve+share    │
 │  ├─ paths.js   DATA_ROOT     ├─ publish.js    → GitHub       │
 │  └─ test.js    49 checks     └─ tunnel.js     Cloudflare     │
@@ -35,6 +37,9 @@ State lives next to the code by default (`data.json`, `sandbox/`,
 `transcripts/`, `.tunnel-url`). `paths.js` is the single source of
 truth: `SEAT_DATA_DIR` (or `~/.second-seat` for global installs)
 redirects all of it; `DATA_FILE` still wins for `data.json` (tests).
+Checkouts stay in sync via symlinks (`public/`, `cloudflare/` point at
+the private repos); npm packing materializes the dashboard into the
+tarball via `scripts/materialize-public.js` (+ `restore-public.js`).
 
 ## Cloud layout (paid tier)
 
