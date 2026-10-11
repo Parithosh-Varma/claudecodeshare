@@ -1,11 +1,11 @@
-// One-command share: ensures the relay is up, reuses or creates a
-// connection, and runs the owner agent in the foreground.
-// Usage: npm run share -- [name|connection-id]
+// One-command share: ensures the relay is up, then runs an owner agent
+// for every connection (or just one with [name|connection-id]).
+// Usage: npm run share [-- name|connection-id]
 import { spawn } from "node:child_process";
 
 const PORT = process.env.PORT || 8787;
 const BASE = `http://localhost:${PORT}`;
-const WANT = process.argv[2] || "dev-machine";
+const WANT = process.argv[2]; // optional: name or c_... id; omit = all connections
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const api = (m, p, b) => fetch(BASE + p, {
@@ -38,33 +38,47 @@ if (!(await serverUp())) {
 }
 
 let conns = await api("GET", "/api/connections");
-let conn = null;
-if (WANT.startsWith("c_")) {
-  conn = conns.find((c) => c.id === WANT);
+let targets = [];
+if (WANT && WANT.startsWith("c_")) {
+  const conn = conns.find((c) => c.id === WANT);
   if (!conn) {
     console.error(`no such connection: ${WANT}`);
     console.error("available:", conns.map((c) => `${c.id} (${c.name})`).join(", ") || "(none)");
     process.exit(1);
   }
-  console.log(`using connection ${conn.id} (${conn.name})`);
+  targets = [conn];
+  console.log(`sharing connection ${conn.id} (${conn.name})`);
+} else if (WANT) {
+  targets = conns.filter((c) => c.name === WANT);
+  if (targets.length === 0) {
+    const conn = await api("POST", "/api/connections", { name: WANT });
+    console.log(`created connection ${conn.id} (${conn.name})`);
+    targets = [conn];
+  } else {
+    console.log(`sharing ${targets.length} connection(s) named "${WANT}"`);
+  }
 } else {
-  conn = conns.find((c) => c.name === WANT) ?? conns[0];
-}
-if (conn && !WANT.startsWith("c_")) {
-  console.log(`reusing connection ${conn.id} (${conn.name})`);
-} else if (!conn) {
-  conn = await api("POST", "/api/connections", { name: WANT });
-  console.log(`created connection ${conn.id} (${conn.name})`);
+  targets = conns;
+  if (targets.length === 0) {
+    const conn = await api("POST", "/api/connections", { name: "dev-machine" });
+    console.log(`created connection ${conn.id} (${conn.name})`);
+    targets = [conn];
+  } else {
+    console.log(`sharing all ${targets.length} connection(s)`);
+  }
 }
 
-console.log(`starting agent (Ctrl-C to stop) ...`);
-const agent = spawn("node", ["agent.js", conn.id], { stdio: "inherit" });
+console.log("starting agent(s) (Ctrl-C to stop) ...");
+const agents = targets.map((conn) => {
+  console.log(`  - ${conn.id} (${conn.name})`);
+  return spawn("node", ["agent.js", conn.id], { stdio: "inherit" });
+});
 const shutdown = () => {
-  try { agent.kill(); } catch {}
+  for (const a of agents) try { a.kill(); } catch {}
   if (childServer) { try { process.kill(-childServer.pid); } catch {} }
   process.exit(0);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-await new Promise((resolve) => agent.on("exit", resolve));
+await Promise.all(agents.map((a) => new Promise((resolve) => a.on("exit", resolve))));
 if (childServer) { try { process.kill(-childServer.pid); } catch {} }

@@ -33,7 +33,7 @@ connection, runs the agent — Ctrl-C stops everything it started):
 
 ```sh
 npm install
-npm run share -- [name]
+npm run share [-- name|connection-id]   # no arg = share every connection
 ```
 
 Or step by step:
