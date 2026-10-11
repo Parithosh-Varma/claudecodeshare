@@ -53,21 +53,25 @@ Run the lifecycle test (share → claim → exec → revoke-isolation → expiry
 npm test
 ```
 
-## Publishing sandbox files to GitHub
+## Publishing sessions to GitHub
 
-Whatever a session produces (e.g. files Claude wrote) lives in
-`sandbox/<connection-id>/` on your machine. To push it to GitHub:
+Whatever a session produces lives in `sandbox/<connection-id>/` on your
+machine. The sidebar's **Cloud backup** card pushes it all up:
 
-```sh
-npm run publish -- <owner/repo> [--connection c_...] [--create] [--watch]
-```
+- Click **Push everything** → see exactly which folders and files will go
+  up → confirm. First push creates a **private** repo (default
+  `<you>/claude-session`); every later push reuses it and just adds or
+  updates folders — never a new repo.
+- Each session gets a stable, readable folder (`dev-machine-c2ff7e/…`),
+  so repeat pushes update in place instead of duplicating.
+- Tick **auto-push new files** once and everything Claude makes from then
+  on goes up by itself (survives server restarts).
 
-- One-shot by default; `--watch` keeps polling and pushes new checkpoints.
-- Auth uses `gh` (OS keyring). If `gh` isn't logged in, you'll be asked
-  for a PAT once — it's piped to `gh`, never written to disk.
-- A `.gitignore` for secrets (`.env`, `*.pem`, …) is added automatically.
-- Only publish with a token **you** created, to a repo **you** own. A guest
-  must never paste their PAT into someone else's shared machine.
+CLI equivalent: `npm run publish -- <owner/repo> [--connection c_...]
+[--create] [--watch]`. Auth uses `gh` (OS keyring; PAT asked once if
+needed, never written to disk). A `.gitignore` for secrets is added
+automatically. Only your token, only your repo — a guest must never paste
+their PAT into someone else's shared machine.
 
 ## API
 

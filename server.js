@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 
@@ -108,6 +109,38 @@ const server = http.createServer((req, res) => {
       const c = db.connections[s.connectionId];
       return json(200, { connectionId: s.connectionId, connectionName: c?.name, expiresAt: s.expiresAt, ownerOnline: (owners.get(s.connectionId)?.size ?? 0) > 0 });
     }
+    // Cloud backup status (repo config + last sync + suggested private repo)
+    if (req.method === "GET" && u.pathname === "/api/publish") {
+      const login = ghLogin();
+      return json(200, { config: loadPublishConfig(), status: loadPublishStatus(), watching: !!publishWatcher, suggestedRepo: login ? `${login}/claude-session` : null });
+    }
+    // Cloud backup preview: folder -> files that "Push to GitHub" would upload.
+    if (req.method === "POST" && u.pathname === "/api/publish/preview") {
+      const b = await body();
+      const argv = ["publish.js", "--preview", "--no-auth"];
+      if (b.connection) argv.push("--connection", b.connection);
+      const r = spawnSync(process.execPath, argv, { cwd: __dirname, encoding: "utf8" });
+      try { return json(200, { folders: JSON.parse(r.stdout || "[]") }); }
+      catch { return json(500, { error: "preview failed" }); }
+    }
+    // Cloud backup: push every sandbox to one repo, optionally keep watching.
+    // Runs owner-side (where the files are). Configure once, it auto-pushes.
+    if (req.method === "POST" && u.pathname === "/api/publish") {
+      const b = await body();
+      if (!b.repo && !b.remote) return json(400, { error: "give owner/repo" });
+      const cfg = { repo: b.repo || null, remote: b.remote || null, branch: b.branch || "main", watch: !!b.watch };
+      fs.writeFileSync(PUBLISH_FILE, JSON.stringify(cfg, null, 2));
+      const target = cfg.remote ? ["--remote", cfg.remote] : [cfg.repo];
+      if (cfg.watch) {
+        startPublishWatcher(cfg);
+        return json(200, { ok: true, watching: true, output: `auto-push on -> ${cfg.repo || cfg.remote}` });
+      }
+      stopPublishWatcher();
+      const argv = ["publish.js", ...target, "--branch", cfg.branch, ...(b.create ? ["--create"] : []), "--status-file", PUBLISH_STATUS];
+      const r = spawnSync(process.execPath, argv, { cwd: __dirname, encoding: "utf8" });
+      const output = ((r.stdout || "") + (r.stderr || "")).trim().slice(-2000);
+      return json(200, { ok: r.status === 0, output });
+    }
     // Static frontend
     let f = u.pathname === "/" ? "/index.html" : u.pathname;
     const fp = path.join(__dirname, "public", path.normalize(f).replace(/^\/+/, ""));
@@ -128,6 +161,44 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, path: "/relay" });
 const owners = new Map(); // connectionId -> Set<ws>
 const guests = new Map(); // code -> Set<ws>
+
+// ---- cloud backup watcher (auto-pushes new sandbox files) ----
+const PUBLISH_FILE = path.join(__dirname, "publish.json");
+const PUBLISH_STATUS = path.join(__dirname, "publish-status.json");
+let publishWatcher = null;
+function loadPublishConfig() {
+  try { return JSON.parse(fs.readFileSync(PUBLISH_FILE, "utf8")); } catch { return null; }
+}
+function loadPublishStatus() {
+  try { return JSON.parse(fs.readFileSync(PUBLISH_STATUS, "utf8")); } catch { return null; }
+}
+function stopPublishWatcher() {
+  if (publishWatcher) { try { publishWatcher.kill(); } catch {} publishWatcher = null; }
+}
+function startPublishWatcher(cfg) {
+  stopPublishWatcher();
+  const target = cfg.remote ? ["--remote", cfg.remote] : [cfg.repo];
+  const argv = ["publish.js", ...target, "--branch", cfg.branch || "main", "--watch", "--interval", "30", "--status-file", PUBLISH_STATUS];
+  publishWatcher = spawn(process.execPath, argv, { cwd: __dirname, stdio: ["ignore", "pipe", "pipe"] });
+  publishWatcher.stdout.on("data", (d) => process.stdout.write("[publish] " + d));
+  publishWatcher.stderr.on("data", (d) => process.stderr.write("[publish] " + d));
+  publishWatcher.on("exit", () => { publishWatcher = null; });
+}
+process.on("SIGINT", () => { stopPublishWatcher(); process.exit(0); });
+process.on("SIGTERM", () => { stopPublishWatcher(); process.exit(0); });
+
+let suggestedCache = null, suggestedAt = 0;
+function ghLogin() {
+  if (suggestedCache && Date.now() - suggestedAt < 60000) return suggestedCache;
+  try {
+    const env = { ...process.env };
+    delete env.GITHUB_TOKEN; delete env.GH_TOKEN;
+    const r = spawnSync("gh", ["api", "user", "-q", ".login"], { encoding: "utf8", env });
+    suggestedCache = (r.stdout || "").trim() || null;
+  } catch { suggestedCache = null; }
+  suggestedAt = Date.now();
+  return suggestedCache;
+}
 
 function guestsOfConnection(cid) {
   const out = [];
@@ -221,4 +292,9 @@ wss.on("connection", (ws, req) => {
   ws.close(4400, "role must be owner|guest");
 });
 
+const bootPublish = loadPublishConfig();
+if (bootPublish?.watch && (bootPublish.repo || bootPublish.remote)) {
+  console.log(`[publish] resuming auto-push -> ${bootPublish.repo || bootPublish.remote}`);
+  startPublishWatcher(bootPublish);
+}
 server.listen(PORT, () => console.log(`relay+api on http://localhost:${PORT}`));

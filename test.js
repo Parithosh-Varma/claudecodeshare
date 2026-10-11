@@ -1,6 +1,6 @@
 // Lifecycle test: share -> claim -> exec -> revoke isolates -> expiry rejected.
 // Spawns server + agent on a test port, no external services.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -102,6 +102,12 @@ try {
   const bad = await api("POST", "/api/claim", { code: "nope123", guestId: "x" });
   check("invalid code rejected", bad.status === 404);
 
+  // 8. cloud backup endpoints exist
+  const pub = await api("GET", "/api/publish");
+  check("publish status endpoint", pub.status === 200 && "config" in pub.j && "watching" in pub.j && "suggestedRepo" in pub.j, JSON.stringify(pub.j));
+  const pvc = await api("POST", "/api/publish/preview", {});
+  check("publish preview endpoint", pvc.status === 200 && Array.isArray(pvc.j.folders), JSON.stringify(pvc.j).slice(0, 120));
+
   // 8. agent presence: killing the agent flags offline + notifies guests
   const watcher = new WebSocket(`${RELAY}?role=guest&code=${s2.code}&guestId=watcher`);
   await new Promise((r) => watcher.on("open", r));
@@ -117,6 +123,36 @@ try {
   const afterKill = await api("POST", "/api/claim", { code: s2.code, guestId: "zoe" });
   check("claim reports agent offline", afterKill.status === 200 && afterKill.j.ownerOnline === false, JSON.stringify(afterKill.j));
   try { watcher.close(); } catch {}
+
+  // 9. publish: every sandbox folder -> one repo, repeat pushes append (local bare remote, no network)
+  {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ccpub-"));
+    const bare = path.join(tmp, "cloud.git");
+    const statusFile = path.join(tmp, "status.json");
+    spawnSync("git", ["init", "--bare", bare], { stdio: "pipe" });
+    const tdir = path.join("sandbox", "t-pubtest");
+    fs.mkdirSync(tdir, { recursive: true });
+    fs.writeFileSync(path.join(tdir, "app.txt"), "v1\n");
+    const runPub = (extra = []) => spawnSync("node", ["publish.js", "--remote", bare, "--connection", "t-pubtest", "--no-auth", "--status-file", statusFile, ...extra], { encoding: "utf8" });
+    const r1 = runPub();
+    const log1 = spawnSync("git", ["--git-dir", bare, "log", "--oneline"], { encoding: "utf8" }).stdout.trim().split("\n").filter(Boolean);
+    check("publish pushes sandbox folder to repo", r1.status === 0 && log1.length === 1, log1.join(";") || String(r1.stderr).slice(-200));
+    fs.writeFileSync(path.join(tdir, "app.txt"), "v2\n");
+    fs.writeFileSync(path.join(tdir, "notes.md"), "hi\n");
+    const r2 = runPub();
+    const log2 = spawnSync("git", ["--git-dir", bare, "log", "--oneline"], { encoding: "utf8" }).stdout.trim().split("\n").filter(Boolean);
+    check("repeat push appends to same repo", r2.status === 0 && log2.length === 2, `commits=${log2.length}`);
+    const tree = spawnSync("git", ["--git-dir", bare, "ls-tree", "-r", "--name-only", "HEAD"], { encoding: "utf8" }).stdout;
+    check("files land in a named folder", tree.includes("t-pubtest") && tree.includes("app.txt"), tree.trim().split("\n").slice(0, 5).join(","));
+    const st = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+    check("publish status file written", st.ok === true && st.pushed === true, JSON.stringify(st).slice(0, 140));
+    const pv = runPub(["--preview"]);
+    check("publish preview lists files", pv.status === 0 && pv.stdout.includes("app.txt"), pv.stdout.slice(0, 140));
+    fs.rmSync(tdir, { recursive: true, force: true });
+    const safe = bare.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 80);
+    fs.rmSync(path.join(".cloud", safe), { recursive: true, force: true });
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 } catch (e) {
   check("no harness exception", false, String(e));
 } finally {
