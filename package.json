@@ -1,0 +1,14 @@
+{
+  "name": "claudecodeshare",
+  "version": "0.1.0",
+  "description": "Minimal PandaNpc-style shareable Claude Code relay: revocable, expiring share links",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "agent": "node agent.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
