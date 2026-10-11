@@ -1,12 +1,11 @@
 // One-command share: ensures the relay is up, reuses or creates a
 // connection, and runs the owner agent in the foreground.
-// Usage: npm run share -- [name]
+// Usage: npm run share -- [name|connection-id]
 import { spawn } from "node:child_process";
-import fs from "node:fs";
 
 const PORT = process.env.PORT || 8787;
 const BASE = `http://localhost:${PORT}`;
-const NAME = process.argv[2] || "dev-machine";
+const WANT = process.argv[2] || "dev-machine";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const api = (m, p, b) => fetch(BASE + p, {
@@ -39,11 +38,22 @@ if (!(await serverUp())) {
 }
 
 let conns = await api("GET", "/api/connections");
-let conn = conns.find((c) => c.name === NAME) ?? conns[0];
-if (conn) {
-  console.log(`reusing connection ${conn.id} (${conn.name})`);
+let conn = null;
+if (WANT.startsWith("c_")) {
+  conn = conns.find((c) => c.id === WANT);
+  if (!conn) {
+    console.error(`no such connection: ${WANT}`);
+    console.error("available:", conns.map((c) => `${c.id} (${c.name})`).join(", ") || "(none)");
+    process.exit(1);
+  }
+  console.log(`using connection ${conn.id} (${conn.name})`);
 } else {
-  conn = await api("POST", "/api/connections", { name: NAME });
+  conn = conns.find((c) => c.name === WANT) ?? conns[0];
+}
+if (conn && !WANT.startsWith("c_")) {
+  console.log(`reusing connection ${conn.id} (${conn.name})`);
+} else if (!conn) {
+  conn = await api("POST", "/api/connections", { name: WANT });
   console.log(`created connection ${conn.id} (${conn.name})`);
 }
 
