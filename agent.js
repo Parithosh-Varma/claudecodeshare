@@ -3,6 +3,7 @@
 // Each remote guest gets an isolated PTY (real terminal, so TUIs like
 // opencode / claude code render correctly); revoke/expiry kills only that PTY.
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import WebSocket from "ws";
 import * as pty from "node-pty";
@@ -68,15 +69,39 @@ RPROMPT=''
 // connection id), preseeded into the sandbox HOME. Otherwise every guest's
 // opencode collides with the owner's :49374 — which both breaks it and tells
 // the guest another session is running. Never overrides a guest's own choice.
+// Guest opencode gets its own service port per connection (derived from the
+// connection id), preseeded into the sandbox HOME. Otherwise every guest's
+// opencode collides with the owner's :49374 — which both breaks it and tells
+// the guest another session is running. Never overrides a guest's own choice.
+//
+// The port space is wide AND bind-tested. A hash % 1000 collides at ~51% by
+// 38 connections, and two connections landing on one port means the second
+// guest reaches the first guest's service (loopback is open by design, see the
+// confinement note below) and reads that guest's conversation history and
+// tabs. Bind-testing before writing makes that collision self-healing.
+const PORT_LO = 49500, PORT_HI = 65000;
+const portFree = (p) => new Promise((res) => {
+  const s = net.createServer();
+  s.once("error", () => res(false));
+  s.once("listening", () => s.close(() => res(true)));
+  s.listen(p, "127.0.0.1");
+});
+async function guestPort(id) {
+  const base = PORT_LO + (parseInt(id.replace(/^c_/, "").slice(0, 12), 16) % (PORT_HI - PORT_LO));
+  for (let i = 0; i <= PORT_HI - PORT_LO; i++) {
+    const p = PORT_LO + ((base - PORT_LO + i) % (PORT_HI - PORT_LO));
+    if (await portFree(p)) return p;
+  }
+  return base; // every port busy; let opencode pick and log the conflict
+}
 try {
-  const port = 49500 + (parseInt(CONNECTION_ID.replace(/^c_/, "").slice(0, 8), 16) % 1000);
   const cfgDir = path.join(sandbox, ".config", "opencode");
   fs.mkdirSync(cfgDir, { recursive: true });
   const svcFile = path.join(cfgDir, "service.json");
   let svc = {};
   try { svc = JSON.parse(fs.readFileSync(svcFile, "utf8")); } catch { /* fresh */ }
   if (svc.port == null) {
-    svc.port = port;
+    svc.port = await guestPort(CONNECTION_ID);
     fs.writeFileSync(svcFile, JSON.stringify(svc, null, 2));
   }
   console.log(`[agent] guest opencode port: ${svc.port}`);
