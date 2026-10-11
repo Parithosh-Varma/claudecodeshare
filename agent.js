@@ -96,9 +96,9 @@ function connect() {
     }
     } catch (e) { console.error("[agent] message handler error:", e.message); }
   });
-  ws.on("close", () => {
+  ws.on("close", (code, reason) => {
     for (const id of [...sessions.keys()]) killSession(id);
-    console.log("[agent] relay closed, reconnecting in 2s");
+    console.log(`[agent] relay closed (${code}${reason ? " " + reason : ""}), reconnecting in 2s`);
     setTimeout(connect, 2000);
   });
   ws.on("error", () => {});

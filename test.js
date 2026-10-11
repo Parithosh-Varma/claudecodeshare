@@ -11,6 +11,7 @@ const BASE = `http://localhost:${PORT}`;
 const RELAY = `ws://localhost:${PORT}/relay`;
 // Isolated store so tests never touch the real data.json
 const TEST_DATA = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ccshare-")), "data.json");
+let __connId = null; // test connection id, removed from sandbox/ in finally
 const api = (m, p, b) => fetch(BASE + p, {
   method: m, headers: { "Content-Type": "application/json" },
   body: b ? JSON.stringify(b) : undefined,
@@ -42,6 +43,7 @@ try {
 
   // 1. create connection
   const { j: conn } = await api("POST", "/api/connections", { name: "test-machine" });
+  __connId = conn.id;
   check("create connection", !!conn.id, conn.id || "");
 
   // 2. start owner agent
@@ -160,7 +162,7 @@ try {
   try { globalThis.__ws2?.close(); } catch {}
   try { agent?.kill(); } catch {}
   try { server?.kill(); } catch {}
-  try { if (typeof conn !== "undefined" && conn?.id) fs.rmSync(path.join("sandbox", conn.id), { recursive: true, force: true }); } catch {}
+  try { if (__connId) fs.rmSync(path.join("sandbox", __connId), { recursive: true, force: true }); } catch {}
 }
 console.log(results.map((r) => r.join(" | ")).join("\n"));
 process.exit(process.exitCode || 0);

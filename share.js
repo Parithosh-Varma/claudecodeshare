@@ -69,16 +69,50 @@ if (WANT && WANT.startsWith("c_")) {
 }
 
 console.log("starting agent(s) (Ctrl-C to stop) ...");
-const agents = targets.map((conn) => {
+const agents = new Map(); // connId -> child
+let shuttingDown = false;
+function startAgent(conn) {
+  if (shuttingDown || agents.has(conn.id)) return;
   console.log(`  - ${conn.id} (${conn.name})`);
-  return spawn("node", ["agent.js", conn.id], { stdio: "inherit" });
-});
+  const a = spawn("node", ["agent.js", conn.id], { stdio: "inherit" });
+  agents.set(conn.id, a);
+  a.on("exit", (code) => {
+    agents.delete(conn.id);
+    if (shuttingDown) return;
+    console.log(`[share] agent for ${conn.id} exited (${code ?? "signal"}), restarting in 2s`);
+    setTimeout(() => startAgent(conn), 2000);
+  });
+}
+for (const conn of targets) startAgent(conn);
+
+// Pick up connections created after startup (e.g. via the dashboard's
+// "+ New" button) so `npm run share` keeps serving everything.
+const poll = setInterval(async () => {
+  if (shuttingDown) return;
+  try {
+    const conns = await api("GET", "/api/connections");
+    const wanted = WANT && WANT.startsWith("c_")
+      ? conns.filter((c) => c.id === WANT)
+      : WANT
+        ? conns.filter((c) => c.name === WANT)
+        : conns;
+    for (const conn of wanted) {
+      if (!agents.has(conn.id)) {
+        console.log(`[share] new connection ${conn.id} (${conn.name}) — starting agent`);
+        startAgent(conn);
+      }
+    }
+  } catch {}
+}, 5000);
+
 const shutdown = () => {
-  for (const a of agents) try { a.kill(); } catch {}
+  shuttingDown = true;
+  clearInterval(poll);
+  for (const a of agents.values()) try { a.kill(); } catch {}
   if (childServer) { try { process.kill(-childServer.pid); } catch {} }
   process.exit(0);
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
-await Promise.all(agents.map((a) => new Promise((resolve) => a.on("exit", resolve))));
-if (childServer) { try { process.kill(-childServer.pid); } catch {} }
+// Agents respawn on unexpected exit; run until signal.
+await new Promise(() => {});
