@@ -17,6 +17,6 @@ publish-status.json
 !.env.example
 
 # Paid hosted service lives in the private second-seat-cloud repo.
-# Kept on disk here for local dev + deploys, never committed publicly.
-cloudflare/
-public/
+# Local copies are symlinks there; never committed publicly.
+cloudflare
+public
