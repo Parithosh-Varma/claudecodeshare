@@ -26,6 +26,19 @@ guest browser --wss--> relay (server.js) <--wss-- agent (agent.js, on your dev m
 - `agent.js`: runs beside your code. One isolated shell per guest (`./sandbox/<connectionId>`). Swap one line (`SHELL_CMD`) to drive `claude` instead of `sh`.
 - `public/index.html`: minimal UI — create, share with expiry, "Connections I shared" (copy/revoke), claim via `?connect=CODE`, terminal.
 
+## Trust & control
+
+- **Waiting room**: tick "Approve each guest" when sharing. Claimants wait until you Approve/Deny them in the sidebar (or via `POST /api/pending/approve`). Decisions persist across relay restarts.
+- **Per-guest kick**: "Guests online" lists live guests; Kick drops one PTY, everyone else stays.
+- **Share modes**: Full (default), Read-only (input ignored), or Approve commands (each Enter-line waits in the "Command approvals" inbox until you allow/deny it).
+- **Session transcripts**: everything relayed is appended to `transcripts/<connection>/<code>-<guest>.log`, viewable in the dashboard.
+- **Guest confinement** (macOS): the guest shell runs under a Seatbelt profile — all of `/Users` is denied except its sandbox folder; API keys/tokens never enter its environment; its prompt shows `guest@shared` instead of your user@host. Each connection's sandbox also gets its own opencode service port so guests never collide with yours. `ps` output cannot be hidden by Seatbelt — guests can see process names.
+- **Idle timeouts**: shells idle over `IDLE_TIMEOUT_MS` (default 30 min) close themselves.
+- **Restart survival**: PTYs survive relay drops; the browser auto-rejoins with the same guest id and lands back in its live shell.
+- **Files**: owner and guest file browsers with download + base64 upload, rooted at the sandbox (traversal rejected).
+- **Notifications**: optional Telegram bot / Discord webhook ping on guest request / join / leave.
+- **Rename/delete machines**: sidebar buttons; delete kills that machine's shares and guests (sandbox files are kept).
+
 ## Quickstart
 
 One command (starts the relay if needed, reuses or creates your
@@ -34,6 +47,13 @@ connection, runs the agent — Ctrl-C stops everything it started):
 ```sh
 npm install
 npm run share [-- name|connection-id]   # no arg = share every connection
+```
+
+Reach guests outside your network via a free Cloudflare tunnel
+(no account, no domain — URL changes each restart):
+
+```sh
+npm run share -- --tunnel
 ```
 
 Or step by step:
@@ -81,6 +101,13 @@ their PAT into someone else's shared machine.
 - `GET /api/shares` → management list (name, claims, expiry, active)
 - `POST /api/shares/:code/revoke` → `{ok}` + instant guest kick
 - `POST /api/claim {code, guestId}` → `{connectionId, ...}` or 403 expired/revoked, 404 invalid
+- Waiting room: `GET /api/pending`, `POST /api/pending/approve {code, guestId, approve}`
+- Guests: `GET /api/guests`, `POST /api/guests/kick {code, guestId}`
+- Approvals: `GET /api/proposals`, `POST /api/proposals/decide {id, approve}`
+- Transcripts: `GET /api/transcripts`, `GET /api/transcripts/:file`
+- Files: `GET /api/files?connection=|?code=[&path=]`, `POST /api/files {connection|code, path, content(base64)}`
+- Machines: `PATCH /api/connections/:id {name}`, `DELETE /api/connections/:id`
+- Notify: `GET|POST /api/notify`, `POST /api/notify/test`
 - `WS /relay?role=owner&connectionId=` and `WS /relay?role=guest&code=&guestId=`
 
 ## Hardening before any real use

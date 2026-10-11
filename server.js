@@ -19,6 +19,18 @@ try {
 } catch { /* fresh */ }
 const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 
+// Public base URL for share links. When a Cloudflare tunnel is up,
+// .tunnel-url holds it (so localhost owners still hand out public links).
+// Behind any proxy, honor X-Forwarded-Proto for the scheme.
+function publicBase(req) {
+  try {
+    const saved = fs.readFileSync(path.join(__dirname, ".tunnel-url"), "utf8").trim();
+    if (saved) return saved.replace(/\/+$/, "");
+  } catch {}
+  const proto = req.headers["x-forwarded-proto"] || "http";
+  return `${proto}://${req.headers.host || `localhost:${PORT}`}`;
+}
+
 const isActive = (s) => {
   if (!s || s.revokedAt) return false;
   if (s.expiresAt && Date.now() > s.expiresAt) return false;
@@ -26,12 +38,125 @@ const isActive = (s) => {
 };
 const shareCode = () => crypto.randomBytes(9).toString("base64url");
 const uid = (p = "") => p + crypto.randomBytes(6).toString("hex");
+if (!db.decisions) db.decisions = {};
+
+// ---- trust & control: approval, modes, proposals, transcripts, notify ----
+const shareMode = (s) => (s && (s.mode === "readonly" || s.mode === "approve") ? s.mode : "full");
+const shareApproval = (s) => (s && s.approval === "manual" ? "manual" : "auto");
+const pendingKey = (code, guestId) => `${code}:${guestId}`;
+const pending = new Map(); // key -> {code, guestId, connectionId, waitingSince, timer}
+const waiting = new Map(); // key -> Set<ws> (connected but not yet approved)
+const proposals = new Map(); // id -> {id, code, guestId, connectionId, raw, at}
+const safeName = (s) => String(s).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+
+// Owner -> * guests fan-out (used by HTTP routes; WS callbacks predate it).
+function tellOwners(connectionId, obj) {
+  const text = JSON.stringify(obj);
+  for (const o of owners.get(connectionId) ?? [])
+    if (o.readyState === 1) { try { o.send(text); } catch {} }
+}
+
+// Session transcripts: every relayed chunk + membership event, per guest.
+const TRANSCRIPTS_DIR = path.join(__dirname, "transcripts");
+let tlogCount = 0;
+function tlog(connectionId, code, guestId, dir, data) {
+  try {
+    const cdir = path.join(TRANSCRIPTS_DIR, safeName(connectionId));
+    fs.mkdirSync(cdir, { recursive: true });
+    const line = JSON.stringify({ t: Date.now(), dir, data: String(data).slice(0, 4000) }) + "\n";
+    const f = path.join(cdir, `${safeName(code)}-${safeName(guestId)}.log`);
+    fs.appendFile(f, line, () => {});
+    if (++tlogCount % 100 === 0) {
+      fs.stat(f, (e, st) => {
+        if (!e && st.size > 5 * 1024 * 1024) fs.rename(f, f + ".old", () => {});
+      });
+    }
+  } catch { /* transcripts must never break the relay */ }
+}
+
+// Join notifications (Telegram / Discord), fire-and-forget.
+const NOTIFY_FILE = path.join(__dirname, "notify.json");
+const loadNotify = () => { try { return JSON.parse(fs.readFileSync(NOTIFY_FILE, "utf8")); } catch { return { telegram: null, discord: null }; } };
+function sendNotify(text) {
+  const cfg = loadNotify();
+  const jobs = [];
+  try {
+    if (cfg.telegram?.botToken && cfg.telegram?.chatId) {
+      jobs.push(fetch(`https://api.telegram.org/bot${cfg.telegram.botToken}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: cfg.telegram.chatId, text }),
+        signal: AbortSignal.timeout(8000),
+      }));
+    }
+    if (cfg.discord?.webhook) {
+      jobs.push(fetch(cfg.discord.webhook, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: text }),
+        signal: AbortSignal.timeout(8000),
+      }));
+    }
+  } catch { /* never break the relay */ }
+  if (jobs.length) Promise.allSettled(jobs).catch(() => {});
+}
+
+// Waiting room: called at claim time and at WS open (idempotent).
+// Returns 'approved' | 'pending' | 'denied'.
+function ensurePending(code, guestId, connectionId) {
+  db.decisions ||= {};
+  const prior = db.decisions[code]?.[guestId];
+  if (prior === "approved" || prior === "denied") return prior;
+  const key = pendingKey(code, guestId);
+  if (pending.has(key)) return "pending";
+  const entry = { code, guestId, connectionId, waitingSince: Date.now(), timer: null };
+  entry.timer = setTimeout(() => {
+    pending.delete(key);
+    db.decisions[code] ||= {};
+    db.decisions[code][guestId] = "denied";
+    save();
+    for (const ws of waiting.get(key) ?? []) {
+      try { ws.send(JSON.stringify({ type: "denied", reason: "no response from owner" })); } catch {}
+      try { ws.close(4403, "approval-timeout"); } catch {}
+    }
+    waiting.delete(key);
+    tlog(connectionId, code, guestId, "event", "approval timed out");
+  }, 10 * 60 * 1000).unref();
+  pending.set(key, entry);
+  return "pending";
+}
+
+// File transfer, rooted at a connection's sandbox (traversal-proof).
+const sandboxOf = (cid) => path.join(__dirname, "sandbox", cid);
+function sandboxPath(cid, p) {
+  if (!p || typeof p !== "string" || p.length > 512) return null;
+  if (p.split("/").includes("..")) return null; // reject escapes outright (403), not just neutralize
+  const norm = path.normalize("/" + p).replace(/^\/+/, "");
+  if (!norm || norm === "." || norm.startsWith("..")) return null;
+  const root = sandboxOf(cid);
+  const full = path.join(root, norm);
+  if (!full.startsWith(root + path.sep)) return null;
+  return full;
+}
+function listFiles(root) {
+  const out = [];
+  const walk = (d, rel) => {
+    if (out.length >= 500) return;
+    let ents; try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const rp = rel ? rel + "/" + e.name : e.name;
+      const fp = path.join(d, e.name);
+      if (e.isDirectory()) walk(fp, rp);
+      else { try { const st = fs.statSync(fp); out.push({ path: rp, size: st.size, mtime: st.mtimeMs }); } catch {} }
+    }
+  };
+  walk(root, "");
+  return out.sort((a, b) => (a.path < b.path ? -1 : 1));
+}
 
 // ---- http ----
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, `http://${req.headers.host}`);
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.end();
 
@@ -73,15 +198,20 @@ const server = http.createServer((req, res) => {
       if (b.expiresInMs != null) expiresAt = Date.now() + Number(b.expiresInMs);
       else if (b.expiry && b.expiry !== "forever") expiresAt = Date.now() + (EXPIRY[b.expiry] ?? EXPIRY["7d"]);
       const code = shareCode();
-      db.shares[code] = { code, connectionId: conn.id, createdAt: Date.now(), expiresAt, revokedAt: null, claims: 0 };
+      db.shares[code] = {
+        code, connectionId: conn.id, createdAt: Date.now(), expiresAt, revokedAt: null, claims: 0,
+        approval: b.approval === "manual" ? "manual" : "auto",
+        mode: ["full", "readonly", "approve"].includes(b.mode) ? b.mode : "full",
+      };
       save();
-      const host = req.headers.host;
-      return json(200, { code, link: `http://${host}/?connect=${code}`, expiresAt });
+      return json(200, { code, link: `${publicBase(req)}/?connect=${code}`, expiresAt, approval: db.shares[code].approval, mode: db.shares[code].mode });
     }
     // "Connections I shared" management page data
     if (req.method === "GET" && u.pathname === "/api/shares") {
       const list = Object.values(db.shares).map((s) => ({
         ...s,
+        approval: shareApproval(s),
+        mode: shareMode(s),
         active: isActive(s),
         connectionName: db.connections[s.connectionId]?.name ?? "(deleted)",
       }));
@@ -107,7 +237,247 @@ const server = http.createServer((req, res) => {
       s.claims += 1;
       save();
       const c = db.connections[s.connectionId];
-      return json(200, { connectionId: s.connectionId, connectionName: c?.name, expiresAt: s.expiresAt, ownerOnline: (owners.get(s.connectionId)?.size ?? 0) > 0 });
+      const guestId = typeof b.guestId === "string" && b.guestId ? b.guestId : null;
+      if (shareApproval(s) === "manual" && guestId) {
+        if (ensurePending(b.code, guestId, s.connectionId) === "pending") {
+          const n = db.connections[s.connectionId]?.name ?? "(deleted)";
+          sendNotify(`🔔 ${guestId} requested access to ${n} — approve in the dashboard`);
+        }
+      }
+      return json(200, { connectionId: s.connectionId, connectionName: c?.name, expiresAt: s.expiresAt, ownerOnline: (owners.get(s.connectionId)?.size ?? 0) > 0, mode: shareMode(s), approval: shareApproval(s) });
+    }
+    // ---- trust & control ----
+    // Waiting room
+    if (req.method === "GET" && u.pathname === "/api/pending") {
+      const list = [...pending.values()].map((p) => ({
+        code: p.code, guestId: p.guestId, connectionId: p.connectionId,
+        connectionName: db.connections[p.connectionId]?.name ?? "(deleted)",
+        waitingSince: p.waitingSince,
+      }));
+      return json(200, list);
+    }
+    if (req.method === "POST" && u.pathname === "/api/pending/approve") {
+      const b = await body();
+      const { code, guestId, approve } = b;
+      const key = pendingKey(code, guestId);
+      const p = pending.get(key);
+      if (p) { clearTimeout(p.timer); pending.delete(key); }
+      db.decisions ||= {};
+      db.decisions[code] ||= {};
+      db.decisions[code][guestId] = approve ? "approved" : "denied";
+      save();
+      const set = waiting.get(key);
+      waiting.delete(key);
+      const s = db.shares[code];
+      if (approve && s && isActive(s)) {
+        for (const ws of set ?? []) {
+          if (ws.readyState !== 1) continue;
+          if (!guests.has(code)) guests.set(code, new Set());
+          guests.get(code).add(ws);
+          ws._joined = true;
+          ws._connectedAt = Date.now();
+          try { ws.send(JSON.stringify({ type: "approved" })); } catch {}
+          tlog(s.connectionId, code, guestId, "event", "approved by owner");
+          tellOwners(s.connectionId, { type: "connect", from: ws._guestId, code });
+          const n = db.connections[s.connectionId]?.name ?? "(deleted)";
+          sendNotify(`✅ ${guestId} joined ${n}`);
+        }
+      } else {
+        for (const ws of set ?? []) {
+          try { ws.send(JSON.stringify({ type: "denied", reason: "denied by owner" })); } catch {}
+          try { ws.close(4403, "denied"); } catch {}
+        }
+        if (s) tlog(s.connectionId, code, guestId, "event", "denied by owner");
+      }
+      return json(200, { ok: true });
+    }
+    // Guests online + per-guest kick
+    if (req.method === "GET" && u.pathname === "/api/guests") {
+      const list = [];
+      for (const [code, set] of guests)
+        for (const g of set)
+          list.push({
+            code, guestId: g._guestId, connectionId: g._connectionId,
+            connectionName: db.connections[g._connectionId]?.name ?? "(deleted)",
+            connectedAt: g._connectedAt ?? null,
+          });
+      return json(200, list);
+    }
+    if (req.method === "POST" && u.pathname === "/api/guests/kick") {
+      const b = await body();
+      let found = false;
+      for (const ws of guests.get(b.code) ?? []) {
+        if (ws._guestId !== b.guestId) continue;
+        found = true;
+        try { ws.send(JSON.stringify({ type: "kicked" })); } catch {}
+        try { ws.close(4403, "kicked"); } catch {}
+      }
+      for (const ws of waiting.get(pendingKey(b.code, b.guestId)) ?? []) {
+        found = true;
+        try { ws.send(JSON.stringify({ type: "denied", reason: "kicked by owner" })); } catch {}
+        try { ws.close(4403, "kicked"); } catch {}
+      }
+      if (found) {
+        const s = db.shares[b.code];
+        if (s) tlog(s.connectionId, b.code, b.guestId, "event", "kicked by owner");
+      }
+      return json(200, { ok: found });
+    }
+    // Approve-mode command proposals
+    if (req.method === "GET" && u.pathname === "/api/proposals") {
+      const list = [...proposals.values()].map((p) => ({
+        id: p.id, code: p.code, guestId: p.guestId, connectionId: p.connectionId,
+        connectionName: db.connections[p.connectionId]?.name ?? "(deleted)",
+        line: p.raw.replace(/[\r\n]+$/, "").slice(0, 200), at: p.at,
+      }));
+      return json(200, list);
+    }
+    if (req.method === "POST" && u.pathname === "/api/proposals/decide") {
+      const b = await body();
+      const p = proposals.get(b.id);
+      if (!p) return json(404, { error: "no such proposal" });
+      proposals.delete(b.id);
+      if (b.approve) {
+        tellOwners(p.connectionId, { type: "input", from: p.guestId, code: p.code, data: p.raw });
+        tlog(p.connectionId, p.code, p.guestId, "event", "proposal approved");
+      } else {
+        for (const ws of guests.get(p.code) ?? []) {
+          if (ws._guestId === p.guestId && ws.readyState === 1)
+            try { ws.send(JSON.stringify({ type: "notice", text: "command denied by owner" })); } catch {}
+        }
+        tlog(p.connectionId, p.code, p.guestId, "event", "proposal denied");
+      }
+      return json(200, { ok: true });
+    }
+    // Session transcripts
+    if (req.method === "GET" && u.pathname === "/api/transcripts") {
+      const list = [];
+      let cids = [];
+      try { cids = fs.readdirSync(TRANSCRIPTS_DIR); } catch { /* none */ }
+      for (const cid of cids) {
+        let files = [];
+        try { files = fs.readdirSync(path.join(TRANSCRIPTS_DIR, cid)); } catch { continue; }
+        for (const f of files) {
+          if (!f.endsWith(".log")) continue;
+          const m = f.match(/^(.+)-([A-Za-z0-9_-]+)\.log$/);
+          if (!m) continue;
+          let st = null;
+          try { st = fs.statSync(path.join(TRANSCRIPTS_DIR, cid, f)); } catch { continue; }
+          list.push({
+            connectionId: cid, connectionName: db.connections[cid]?.name ?? "(deleted)",
+            code: m[1], guestId: m[2], file: `${cid}/${f}`,
+            size: st.size, updatedAt: st.mtimeMs,
+          });
+        }
+      }
+      list.sort((a, b) => b.updatedAt - a.updatedAt);
+      return json(200, list);
+    }
+    const mTranscript = u.pathname.match(/^\/api\/transcripts\/(.+)$/);
+    if (req.method === "GET" && mTranscript) {
+      const parts = mTranscript[1].split("/");
+      if (parts.length !== 2 || parts.some((x) => x !== path.basename(x))) return json(400, { error: "bad file" });
+      const fp = path.join(TRANSCRIPTS_DIR, parts[0], parts[1]);
+      if (!fp.startsWith(TRANSCRIPTS_DIR + path.sep)) return json(400, { error: "bad file" });
+      let st = null;
+      try { st = fs.statSync(fp); } catch { return json(404, { error: "not found" }); }
+      if (!st.isFile()) return json(404, { error: "not found" });
+      const CAP = 200 * 1024;
+      const content = st.size > CAP
+        ? fs.readFileSync(fp, { encoding: "utf8", flag: "r" }).slice(-CAP)
+        : fs.readFileSync(fp, "utf8");
+      return json(200, { content, truncated: st.size > CAP });
+    }
+    // File transfer (owner: ?connection=, guest: ?code= — both rooted at the sandbox)
+    if (req.method === "GET" && u.pathname === "/api/files") {
+      const qConn = u.searchParams.get("connection");
+      const qCode = u.searchParams.get("code");
+      const qPath = u.searchParams.get("path");
+      let cid = null;
+      if (qConn) {
+        if (!db.connections[qConn]) return json(404, { error: "no such connection" });
+        cid = qConn;
+      } else if (qCode) {
+        const s = db.shares[qCode];
+        if (!s) return json(404, { error: "invalid code" });
+        if (!isActive(s)) return json(403, { error: "revoked-or-expired" });
+        cid = s.connectionId;
+      } else return json(400, { error: "connection or code required" });
+      if (!qPath) return json(200, { files: listFiles(sandboxOf(cid)) });
+      const full = sandboxPath(cid, qPath);
+      if (!full) return json(403, { error: "outside sandbox" });
+      let st = null;
+      try { st = fs.statSync(full); } catch { return json(404, { error: "not found" }); }
+      if (!st.isFile()) return json(404, { error: "not found" });
+      res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": st.size, "Content-Disposition": `attachment; filename="${path.basename(full)}"` });
+      return res.end(fs.readFileSync(full));
+    }
+    if (req.method === "POST" && u.pathname === "/api/files") {
+      const b = await body();
+      let cid = null;
+      if (b.connection) {
+        if (!db.connections[b.connection]) return json(404, { error: "no such connection" });
+        cid = b.connection;
+      } else if (b.code) {
+        const s = db.shares[b.code];
+        if (!s) return json(404, { error: "invalid code" });
+        if (!isActive(s)) return json(403, { error: "revoked-or-expired" });
+        cid = s.connectionId;
+      } else return json(400, { error: "connection or code required" });
+      const full = sandboxPath(cid, b.path);
+      if (!full) return json(403, { error: "outside sandbox" });
+      if (typeof b.content !== "string") return json(400, { error: "content required" });
+      let buf = null;
+      try { buf = Buffer.from(b.content, "base64"); } catch { return json(400, { error: "bad content" }); }
+      if (buf.length > 10 * 1024 * 1024) return json(413, { error: "file too large (10MB max)" });
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, buf);
+      return json(200, { ok: true, size: buf.length });
+    }
+    // Rename / delete machines
+    const mConn = u.pathname.match(/^\/api\/connections\/([^/]+)$/);
+    if (mConn && req.method === "PATCH") {
+      const c = db.connections[mConn[1]];
+      if (!c) return json(404, { error: "no such connection" });
+      const b = await body();
+      if (typeof b.name === "string" && b.name.trim()) c.name = b.name.trim().slice(0, 64);
+      save();
+      return json(200, c);
+    }
+    if (mConn && req.method === "DELETE") {
+      const cid = mConn[1];
+      if (!db.connections[cid]) return json(404, { error: "no such connection" });
+      delete db.connections[cid];
+      for (const s of Object.values(db.shares)) {
+        if (s.connectionId !== cid) continue;
+        disconnectGuestsByCode(s.code, 4404, "connection deleted");
+        dropWaitingByCode(s.code, "connection deleted");
+        delete db.shares[s.code];
+        if (db.decisions) delete db.decisions[s.code];
+      }
+      for (const o of owners.get(cid) ?? []) { try { o.close(4404, "connection deleted"); } catch {} }
+      owners.delete(cid);
+      save();
+      return json(200, { ok: true });
+    }
+    // Join notifications
+    if (req.method === "GET" && u.pathname === "/api/notify") {
+      return json(200, { config: loadNotify() });
+    }
+    if (req.method === "POST" && u.pathname === "/api/notify") {
+      const b = await body();
+      const cfg = {
+        telegram: b.telegram?.botToken && b.telegram?.chatId ? { botToken: b.telegram.botToken, chatId: b.telegram.chatId } : null,
+        discord: b.discord?.webhook ? { webhook: b.discord.webhook } : null,
+      };
+      fs.writeFileSync(NOTIFY_FILE, JSON.stringify(cfg, null, 2));
+      return json(200, { ok: true });
+    }
+    if (req.method === "POST" && u.pathname === "/api/notify/test") {
+      const cfg = loadNotify();
+      if (!cfg.telegram && !cfg.discord) return json(200, { ok: false, error: "no channels configured" });
+      sendNotify("✅ test from claudecodeshare — notifications are on");
+      return json(200, { ok: true });
     }
     // Cloud backup status (repo config + last sync + suggested private repo)
     if (req.method === "GET" && u.pathname === "/api/publish") {
@@ -213,6 +583,17 @@ function disconnectGuestsByCode(code, wsCode, reason) {
     try { ws.send(JSON.stringify({ type: "revoked", reason })); } catch {}
     try { ws.close(wsCode, reason); } catch {}
   }
+  dropWaitingByCode(code, reason);
+}
+function dropWaitingByCode(code, reason) {
+  for (const [key, set] of waiting) {
+    if (!key.startsWith(code + ":")) continue;
+    for (const ws of set) {
+      try { ws.send(JSON.stringify({ type: "revoked", reason })); } catch {}
+      try { ws.close(4403, reason); } catch {}
+    }
+    waiting.delete(key);
+  }
 }
 // Expire sweep: expired shares drop their guests, like revoke
 setInterval(() => {
@@ -241,8 +622,10 @@ wss.on("connection", (ws, req) => {
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
       for (const set of guests.values())
         for (const g of set)
-          if (g._guestId === m.to && g._connectionId === cid && g.readyState === 1)
+          if (g._guestId === m.to && g._connectionId === cid && g.readyState === 1) {
             g.send(JSON.stringify({ type: m.type, data: m.data }));
+            tlog(cid, g._code, m.to, m.type === "exit" ? "event" : "out", m.data ?? m.type);
+          }
     });
     ws.on("close", () => {
       owners.get(cid)?.delete(ws);
@@ -263,10 +646,38 @@ wss.on("connection", (ws, req) => {
     ws._role = "guest"; ws._code = code;
     ws._guestId = u.searchParams.get("guestId") || ws._id;
     ws._connectionId = s.connectionId;
-    if (!guests.has(code)) guests.set(code, new Set());
-    guests.get(code).add(ws);
+    ws._joined = false;
+    const key = pendingKey(code, ws._guestId);
     const targets = () => owners.get(s.connectionId) ?? new Set();
+    const notifyOwner = (type) => {
+      for (const o of targets())
+        if (o.readyState === 1)
+          o.send(JSON.stringify({ type, from: ws._guestId, code }));
+    };
+    const join = () => {
+      if (ws._joined) return;
+      if (!guests.has(code)) guests.set(code, new Set());
+      guests.get(code).add(ws);
+      ws._joined = true;
+      ws._connectedAt = Date.now();
+      notifyOwner("connect");
+      tlog(s.connectionId, code, ws._guestId, "event", "joined");
+      const n = db.connections[s.connectionId]?.name ?? "(deleted)";
+      sendNotify(`✅ ${ws._guestId} joined ${n}`);
+    };
+    const propose = (raw) => {
+      const mine = [...proposals.values()].filter((p) => p.code === code && p.guestId === ws._guestId);
+      if (mine.length >= 20) {
+        try { ws.send(JSON.stringify({ type: "notice", text: "approval queue full — wait for the owner" })); } catch {}
+        return;
+      }
+      const id = uid("p_");
+      proposals.set(id, { id, code, guestId: ws._guestId, connectionId: s.connectionId, raw, at: Date.now() });
+      tlog(s.connectionId, code, ws._guestId, "event", "proposal: " + raw.replace(/[\r\n]+$/, "").slice(0, 200));
+      try { ws.send(JSON.stringify({ type: "notice", text: "sent to owner for approval" })); } catch {}
+    };
     ws.on("message", (raw) => {
+      if (!ws._joined) return; // waiting-room guests can't send anything yet
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
       // Re-check revocation/expiry on every message (instant kick)
       const cur = db.shares[code];
@@ -275,17 +686,67 @@ wss.on("connection", (ws, req) => {
         return ws.close(4403, "revoked-or-expired");
       }
       if (m.type !== "input" && m.type !== "resize" && m.type !== "connect") return;
+      if (m.type === "input" && typeof m.data === "string") {
+        tlog(s.connectionId, code, ws._guestId, "in", m.data);
+        const mode = shareMode(cur);
+        if (mode === "readonly") {
+          if (!ws._roNoticed) {
+            ws._roNoticed = true;
+            try { ws.send(JSON.stringify({ type: "notice", text: "read-only share — input is ignored" })); } catch {}
+          }
+          return;
+        }
+        if (mode === "approve") {
+          // Lone control characters (Ctrl-C etc.) pass through so guests can interrupt.
+          if (m.data.length === 1 && m.data.charCodeAt(0) < 32) {
+            for (const o of targets())
+              if (o.readyState === 1)
+                o.send(JSON.stringify({ type: m.type, from: ws._guestId, code, data: m.data, cols: m.cols, rows: m.rows }));
+            return;
+          }
+          ws._lineBuf = (ws._lineBuf || "") + m.data;
+          let nl;
+          let proposed = false;
+          while ((nl = ws._lineBuf.search(/[\r\n]/)) !== -1) {
+            propose(ws._lineBuf.slice(0, nl + 1));
+            ws._lineBuf = ws._lineBuf.slice(nl + 1);
+            proposed = true;
+          }
+          if (!proposed && ws._lineBuf.length > 4096) {
+            propose(ws._lineBuf);
+            ws._lineBuf = "";
+          }
+          return;
+        }
+      }
       for (const o of targets())
         if (o.readyState === 1)
           o.send(JSON.stringify({ type: m.type, from: ws._guestId, code, data: m.data, cols: m.cols, rows: m.rows }));
     });
-    const notifyOwner = (type) => {
-      for (const o of targets())
-        if (o.readyState === 1)
-          o.send(JSON.stringify({ type, from: ws._guestId, code }));
-    };
-    ws.on("close", () => { guests.get(code)?.delete(ws); notifyOwner("disconnect"); });
-    notifyOwner("connect");
+    ws.on("close", () => {
+      guests.get(code)?.delete(ws);
+      waiting.get(key)?.delete(ws);
+      if (ws._joined) {
+        notifyOwner("disconnect");
+        tlog(s.connectionId, code, ws._guestId, "event", "left");
+        const n = db.connections[s.connectionId]?.name ?? "(deleted)";
+        sendNotify(`👋 ${ws._guestId} left ${n}`);
+      }
+    });
+    const decision = db.decisions?.[code]?.[ws._guestId];
+    if (decision === "denied") {
+      try { ws.send(JSON.stringify({ type: "denied", reason: "denied by owner" })); } catch {}
+      return ws.close(4403, "denied");
+    }
+    if (shareApproval(s) === "auto" || decision === "approved") {
+      join();
+    } else {
+      ensurePending(code, ws._guestId, s.connectionId);
+      if (!waiting.has(key)) waiting.set(key, new Set());
+      waiting.get(key).add(ws);
+      try { ws.send(JSON.stringify({ type: "waiting" })); } catch {}
+      tlog(s.connectionId, code, ws._guestId, "event", "waiting for approval");
+    }
     ws.send(JSON.stringify({ type: "ready", id: ws._guestId }));
     return;
   }

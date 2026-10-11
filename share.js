@@ -1,11 +1,16 @@
 // One-command share: ensures the relay is up, then runs an owner agent
 // for every connection (or just one with [name|connection-id]).
-// Usage: npm run share [-- name|connection-id]
+// Usage: npm run share [-- name|connection-id] [--tunnel]
+//   --tunnel  expose the relay via Cloudflare quick tunnel so guests
+//             outside your network can reach it (share links use the URL).
 import { spawn } from "node:child_process";
+import { startTunnel, stopTunnel } from "./tunnel.js";
 
 const PORT = process.env.PORT || 8787;
 const BASE = `http://localhost:${PORT}`;
-const WANT = process.argv[2]; // optional: name or c_... id; omit = all connections
+const ARGS = process.argv.slice(2);
+const WANT = ARGS.find((a) => !a.startsWith("--"));
+const WANT_TUNNEL = ARGS.includes("--tunnel");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const api = (m, p, b) => fetch(BASE + p, {
@@ -35,6 +40,16 @@ if (!(await serverUp())) {
   console.log("relay is up");
 } else {
   console.log("relay already running");
+}
+
+let tunnel = null;
+if (WANT_TUNNEL) {
+  try {
+    tunnel = await startTunnel(PORT);
+    console.log(`public URL: ${tunnel.url}  (share links use it; guests need no setup)`);
+  } catch (e) {
+    console.error(`tunnel failed: ${e.message} — continuing on LAN only`);
+  }
 }
 
 let conns = await api("GET", "/api/connections");
@@ -79,6 +94,7 @@ function startAgent(conn) {
   a.on("exit", (code) => {
     agents.delete(conn.id);
     if (shuttingDown) return;
+    if (code === 44) { console.log(`[share] agent for ${conn.id} stopped (connection gone)`); return; }
     console.log(`[share] agent for ${conn.id} exited (${code ?? "signal"}), restarting in 2s`);
     setTimeout(() => startAgent(conn), 2000);
   });
@@ -102,6 +118,13 @@ const poll = setInterval(async () => {
         startAgent(conn);
       }
     }
+    for (const id of [...agents.keys()]) {
+      if (!conns.some((c) => c.id === id)) {
+        console.log(`[share] connection ${id} deleted — stopping agent`);
+        try { agents.get(id)?.kill(); } catch {}
+        agents.delete(id);
+      }
+    }
   } catch {}
 }, 5000);
 
@@ -109,6 +132,7 @@ const shutdown = () => {
   shuttingDown = true;
   clearInterval(poll);
   for (const a of agents.values()) try { a.kill(); } catch {}
+  if (tunnel) stopTunnel(tunnel.child);
   if (childServer) { try { process.kill(-childServer.pid); } catch {} }
   process.exit(0);
 };

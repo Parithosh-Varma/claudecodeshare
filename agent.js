@@ -3,7 +3,6 @@
 // Each remote guest gets an isolated PTY (real terminal, so TUIs like
 // opencode / claude code render correctly); revoke/expiry kills only that PTY.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
@@ -16,6 +15,10 @@ if (!CONNECTION_ID) {
   console.error("usage: CONNECTION_ID=xxx node agent.js  (or node agent.js <connectionId>)");
   process.exit(1);
 }
+// Idle sessions die on their own so forgotten guests don't linger forever.
+// Override with IDLE_TIMEOUT_MS (tests use a short one).
+const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS || 30 * 60 * 1000);
+const SWEEP_MS = Math.min(30_000, Math.max(1000, Math.floor(IDLE_TIMEOUT_MS / 2)));
 const SHELL = resolveShell();
 
 // Resolve to an absolute, executable shell up front so a broken/stripped
@@ -38,68 +41,214 @@ function resolveShell() {
 
 const sandbox = path.join(__dirname, "sandbox", CONNECTION_ID);
 fs.mkdirSync(sandbox, { recursive: true });
+const guestTmp = path.join(sandbox, ".tmp");
+fs.mkdirSync(guestTmp, { recursive: true });
 
-const sessions = new Map(); // guestId -> pty.IPty
-
-function killSession(id) {
-  const p = sessions.get(id);
-  if (p) { try { p.kill(); } catch {} sessions.delete(id); console.log(`[agent] session ended: ${id}`); }
+// Neutral guest identity: the prompt must not leak the host's username or
+// hostname (default zsh shows user@host, and Apple's /etc/zshrc emits OSC7
+// sequences containing both). HOME is the sandbox, so ~ = shared folder.
+if (process.platform === "darwin") {
+  const zshrc = path.join(sandbox, ".zshrc");
+  try {
+    fs.accessSync(zshrc);
+  } catch {
+    fs.writeFileSync(zshrc, `# Created by claudecodeshare: neutral guest identity.
+# ~ below is the shared folder (HOME is remapped), not the host's home.
+precmd_functions=()
+chpwd_functions=()
+PROMPT='guest@shared %~ %# '
+RPROMPT=''
+`);
+  }
 }
 
-function ensureSession(ws, id, cols = 80, rows = 24) {
-  if (sessions.has(id)) return sessions.get(id);
+// Guest opencode gets its own service port per connection (derived from the
+// connection id), preseeded into the sandbox HOME. Otherwise every guest's
+// opencode collides with the owner's :49374 — which both breaks it and tells
+// the guest another session is running. Never overrides a guest's own choice.
+try {
+  const port = 49500 + (parseInt(CONNECTION_ID.replace(/^c_/, "").slice(0, 8), 16) % 1000);
+  const cfgDir = path.join(sandbox, ".config", "opencode");
+  fs.mkdirSync(cfgDir, { recursive: true });
+  const svcFile = path.join(cfgDir, "service.json");
+  let svc = {};
+  try { svc = JSON.parse(fs.readFileSync(svcFile, "utf8")); } catch { /* fresh */ }
+  if (svc.port == null) {
+    svc.port = port;
+    fs.writeFileSync(svcFile, JSON.stringify(svc, null, 2));
+  }
+  console.log(`[agent] guest opencode port: ${svc.port}`);
+} catch (e) { console.warn("[agent] could not preseed opencode port:", e.message); }
+
+// ---- guest confinement ----
+// The guest shell must never reach the host's files (~/Downloads, ~/.ssh,
+// the repo root holding data.json with other share codes, ...).
+// On macOS we wrap the shell in a Seatbelt profile: everything under /Users
+// is off-limits except this connection's sandbox dir. Ancestor dirs get
+// metadata-only access so getcwd/pwd keep working (listing/reading them
+// is still denied). Elsewhere (system binaries, /opt, /tmp, network) the
+// guest keeps normal access so real tools (node, opencode, ...) still run.
+// NOTE: Seatbelt cannot hide the process table (no such operation; blocking
+// sysctl breaks the shell and node), so guests can see process names.
+// Full isolation needs containers — see README.
+const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
+let confined = false, spawnFile = SHELL, spawnArgs = [];
+if (process.env.ALLOW_UNCONFINED !== "1" && process.platform === "darwin") {
+  try {
+    fs.accessSync(SANDBOX_EXEC, fs.constants.X_OK);
+    const ancestors = [];
+    for (let d = sandbox; d.startsWith("/Users/") && d !== "/Users"; d = path.dirname(d)) ancestors.unshift(d);
+    ancestors.unshift("/Users");
+    const profile = "(version 1)(allow default)"
+      + '(deny file* (subpath "/Users"))'
+      + `(allow file-read-metadata ${ancestors.map((d) => `(subpath "${d}")`).join("")})`
+      + `(allow file* (subpath "${sandbox}"))`;
+    spawnFile = SANDBOX_EXEC;
+    spawnArgs = ["-p", profile, SHELL];
+    confined = true;
+  } catch { /* fall through to unconfined with a warning below */ }
+}
+if (confined) console.log(`[agent] confinement: seatbelt, files limited to ${sandbox}`);
+else console.warn("[agent] WARNING: running UNCONFINED (ALLOW_UNCONFINED=1 or no sandbox-exec) — guests can read host files");
+
+// Guest env: start from ours but scrub anything that would hand over the
+// owner's identity or quota: API keys/tokens, agent-forwarding sockets, and
+// shell history locations. HOME points at the sandbox so guests configure
+// their own tools/keys in isolation (their own quota, not yours).
+// USER/LOGNAME/HOSTNAME are neutralized so prompts and TUIs don't leak them.
+const SECRET_RE = /API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|SSH_AUTH_SOCK|SSH_AGENT_PID/i;
+function guestEnv() {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (SECRET_RE.test(k)) continue;
+    env[k] = v;
+  }
+  env.HOME = sandbox;
+  env.ZDOTDIR = sandbox;
+  env.HISTFILE = path.join(sandbox, ".zsh_history");
+  env.TMPDIR = guestTmp + "/";
+  env.TERM = "xterm-256color";
+  env.USER = "guest";
+  env.LOGNAME = "guest";
+  env.HOSTNAME = "shared-machine";
+  return env;
+}
+
+// Sessions survive relay disconnects (see connect()): a guest that rejoins
+// with the same id gets their live shell back, output gap included.
+const sessions = new Map(); // guestId -> {pty, lastActive, pending}
+let currentWs = null; // owner relay socket; null between reconnects
+
+function sendTo(id, msg) {
+  const ws = currentWs;
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify({ to: id, ...msg })); return true; } catch { /* fall through */ }
+  }
+  return false;
+}
+
+function killSession(id, note) {
+  const s = sessions.get(id);
+  if (!s) return;
+  sessions.delete(id);
+  if (note) sendTo(id, { type: "exit", data: `\r\n[${note}]\r\n` });
+  try { s.pty.kill(); } catch {}
+  console.log(`[agent] session ended: ${id}${note ? ` (${note})` : ""}`);
+}
+
+function touch(id) {
+  const s = sessions.get(id);
+  if (s) s.lastActive = Date.now();
+}
+
+function ensureSession(id, cols = 80, rows = 24) {
+  const existing = sessions.get(id);
+  if (existing) { touch(id); return existing.pty; }
   console.log(`[agent] new session for ${id} (cwd=${sandbox}, shell=${SHELL})`);
   let p;
   try {
-    p = pty.spawn(SHELL, [], {
+    p = pty.spawn(spawnFile, spawnArgs, {
       name: "xterm-256color",
       cols, rows,
       cwd: sandbox,
-      env: { ...process.env, TERM: "xterm-256color" },
+      env: guestEnv(),
     });
   } catch (e) {
     // Never crash the agent: tell this guest and stay up for everyone else.
     console.error(`[agent] failed to start shell for ${id}: ${e.message}`);
-    try { ws.send(JSON.stringify({ type: "exit", to: id, data: `\r\n[failed to start shell: ${e.message}]\r\n` })); } catch {}
+    sendTo(id, { type: "exit", data: `\r\n[failed to start shell: ${e.message}]\r\n` });
     return null;
   }
-  sessions.set(id, p);
+  const sess = { pty: p, lastActive: Date.now(), pending: "" };
+  sessions.set(id, sess);
   p.onData((d) => {
-    try { ws.send(JSON.stringify({ type: "output", to: id, data: d })); } catch {}
+    sess.lastActive = Date.now();
+    if (!sendTo(id, { type: "output", data: d })) {
+      // Relay is down: hold a bounded gap buffer, flush on reconnect.
+      if (sess.pending.length < 65536) sess.pending += d;
+    }
   });
   p.onExit(({ exitCode }) => {
-    try { ws.send(JSON.stringify({ type: "exit", to: id, data: `\r\n[process exited (${exitCode})]\r\n` })); } catch {}
     sessions.delete(id);
+    sendTo(id, { type: "exit", data: `\r\n[process exited (${exitCode})]\r\n` });
   });
   p.write(`echo 'connected to ${CONNECTION_ID} as ${id}'\r`);
   return p;
 }
 
+// Idle sweep: forgotten shells close themselves.
+setInterval(() => {
+  const now = Date.now();
+  for (const id of [...sessions.keys()]) {
+    const s = sessions.get(id);
+    if (s && now - s.lastActive > IDLE_TIMEOUT_MS) killSession(id, "idle timeout — session closed");
+  }
+}, SWEEP_MS).unref();
+
+let backoffAttempts = 0;
 function connect() {
   const ws = new WebSocket(`${RELAY}?role=owner&connectionId=${CONNECTION_ID}`);
-  ws.on("open", () => console.log(`[agent] serving ${CONNECTION_ID} via ${RELAY}`));
+  ws.on("open", () => {
+    currentWs = ws;
+    backoffAttempts = 0;
+    console.log(`[agent] serving ${CONNECTION_ID} via ${RELAY}`);
+    // Flush output buffered while the relay was down.
+    for (const [id, s] of sessions) {
+      if (s.pending) { const gap = s.pending; s.pending = ""; sendTo(id, { type: "output", data: gap }); }
+    }
+  });
   ws.on("message", (raw) => {
     try {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     if (m.type === "ready") return;
-    if (m.type === "connect") { ensureSession(ws, m.from, m.cols, m.rows); return; }
+    if (m.type === "connect") { ensureSession(m.from, m.cols, m.rows); return; }
     if (m.type === "disconnect") { killSession(m.from); return; }
     if (m.type === "resize") {
-      const p = sessions.get(m.from);
-      if (p && m.cols && m.rows) { try { p.resize(m.cols, m.rows); } catch {} }
+      const s = sessions.get(m.from);
+      if (s && m.cols && m.rows) { try { s.pty.resize(m.cols, m.rows); } catch {} }
       return;
     }
     if (m.type === "input") {
-      const p = ensureSession(ws, m.from);
+      const p = ensureSession(m.from);
       if (!p) return;
+      touch(m.from);
       try { p.write(m.data); } catch {}
     }
     } catch (e) { console.error("[agent] message handler error:", e.message); }
   });
   ws.on("close", (code, reason) => {
-    for (const id of [...sessions.keys()]) killSession(id);
-    console.log(`[agent] relay closed (${code}${reason ? " " + reason : ""}), reconnecting in 2s`);
-    setTimeout(connect, 2000);
+    if (currentWs === ws) currentWs = null;
+    if (code === 4404) {
+      // Connection was deleted server-side: stop, don't hot-loop forever.
+      // Exit 44 tells share.js not to respawn this agent.
+      console.error(`[agent] connection ${CONNECTION_ID} gone (${reason || "deleted"}), stopping`);
+      process.exit(44);
+    }
+    // Sessions stay alive: same-id guests reattach on reconnect.
+    const delay = Math.min(2000 * 2 ** backoffAttempts, 30000);
+    backoffAttempts += 1;
+    console.log(`[agent] relay closed (${code}${reason ? " " + reason : ""}), reconnecting in ${Math.round(delay / 1000)}s (sessions kept)`);
+    setTimeout(connect, delay);
   });
   ws.on("error", () => {});
 }

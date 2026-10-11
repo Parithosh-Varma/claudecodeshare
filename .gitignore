@@ -1,6 +1,9 @@
 node_modules/
 data.json
 sandbox/
+.tunnel-url
+transcripts/
+notify.json
 public/vendor/
 .cloud/
 publish.json

@@ -57,6 +57,14 @@ try {
   check("claim valid code", c1.status === 200, JSON.stringify(c1.j));
   check("claim reports agent online", c1.j.ownerOnline === true, JSON.stringify(c1.j));
 
+  // 3b. tunnel: share links embed the public URL when .tunnel-url exists
+  {
+    fs.writeFileSync(".tunnel-url", "https://demo-abc123.trycloudflare.com/\n");
+    const { j: st } = await api("POST", `/api/connections/${conn.id}/share`, { expiry: "7d" });
+    check("share link uses tunnel URL", st.link === `https://demo-abc123.trycloudflare.com/?connect=${st.code}`, st.link);
+    fs.rmSync(".tunnel-url", { force: true });
+  }
+
   // 4. guest exec round-trip through owner agent
   const out = await new Promise((resolve, reject) => {
     const ws = new WebSocket(`${RELAY}?role=guest&code=${s1.code}&guestId=alice`);
@@ -71,6 +79,154 @@ try {
     ws._testWs = true; globalThis.__ws1 = ws;
   });
   check("guest input executes on owner machine", out.includes("hello-ROUNDTRIP-123"));
+
+  // helper: open a guest socket with a message collector
+  const openGuest = (code, guestId) => new Promise((resolve, reject) => {
+    const ws = new WebSocket(`${RELAY}?role=guest&code=${code}&guestId=${guestId}`);
+    const seen = [];
+    ws.on("message", (raw) => { try { seen.push(JSON.parse(raw.toString())); } catch {} });
+    ws.on("open", () => resolve({ ws, seen }));
+    ws.on("error", reject);
+  });
+  const seenText = (seen) => seen.map((m) => m.data || "").join("");
+
+  // 4c. waiting room: manual approval gates the shell
+  const { j: sMan } = await api("POST", `/api/connections/${conn.id}/share`, { expiry: "7d", approval: "manual" });
+  check("manual share records approval mode", sMan.approval === "manual");
+  await api("POST", "/api/claim", { code: sMan.code, guestId: "g1" });
+  const g1 = await openGuest(sMan.code, "g1");
+  await sleep(800);
+  check("manual share holds guest in waiting room", g1.seen.some((m) => m.type === "waiting"));
+  g1.ws.send(JSON.stringify({ type: "input", data: "echo SHOULD-NOT-APPEAR\n" }));
+  await sleep(1200);
+  check("waiting guest gets no shell", !seenText(g1.seen).includes("SHOULD-NOT-APPEAR"));
+  const pend = await api("GET", "/api/pending");
+  check("pending lists waiting guest", pend.j.some((p) => p.guestId === "g1" && p.code === sMan.code));
+  await api("POST", "/api/pending/approve", { code: sMan.code, guestId: "g1", approve: true });
+  const g1out = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(seenText(g1.seen)), 9000);
+    const iv = setInterval(() => {
+      if (g1.seen.some((m) => m.type === "approved")) {
+        try { g1.ws.send(JSON.stringify({ type: "input", data: "echo APPROVED-OK\n" })); } catch {}
+      }
+      if (seenText(g1.seen).includes("APPROVED-OK")) { clearTimeout(timer); clearInterval(iv); resolve(seenText(g1.seen)); }
+    }, 300);
+  });
+  check("approved guest gets a shell", g1out.includes("APPROVED-OK"));
+  try { g1.ws.close(); } catch {}
+  await api("POST", "/api/claim", { code: sMan.code, guestId: "g2" });
+  const g2 = await openGuest(sMan.code, "g2");
+  await sleep(600);
+  await api("POST", "/api/pending/approve", { code: sMan.code, guestId: "g2", approve: false });
+  const denied = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 6000);
+    const iv = setInterval(() => {
+      if (g2.seen.some((m) => m.type === "denied") || g2.ws.readyState === WebSocket.CLOSED) { clearTimeout(timer); clearInterval(iv); resolve(true); }
+    }, 200);
+  });
+  check("denied guest is turned away", denied);
+  try { g2.ws.close(); } catch {}
+
+  // 4d. per-guest kick
+  const gk = await openGuest(s1.code, "kickme");
+  await sleep(800);
+  const gl = await api("GET", "/api/guests");
+  check("guests list shows online guest", gl.j.some((g) => g.guestId === "kickme"));
+  await api("POST", "/api/guests/kick", { code: s1.code, guestId: "kickme" });
+  const kicked = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 6000);
+    const iv = setInterval(() => {
+      if (gk.seen.some((m) => m.type === "kicked") || gk.ws.readyState === WebSocket.CLOSED) { clearTimeout(timer); clearInterval(iv); resolve(true); }
+    }, 200);
+  });
+  check("kicked guest is disconnected", kicked);
+  try { gk.ws.close(); } catch {}
+
+  // 4e. read-only mode drops input
+  const { j: sRo } = await api("POST", `/api/connections/${conn.id}/share`, { expiry: "7d", mode: "readonly" });
+  check("readonly share records mode", sRo.mode === "readonly");
+  await api("POST", "/api/claim", { code: sRo.code, guestId: "ro" });
+  const gro = await openGuest(sRo.code, "ro");
+  await sleep(600);
+  gro.ws.send(JSON.stringify({ type: "input", data: "echo RO-MARKER\n" }));
+  await sleep(1500);
+  check("read-only guest input is ignored", !seenText(gro.seen).includes("RO-MARKER") && gro.seen.some((m) => m.type === "notice"));
+  try { gro.ws.close(); } catch {}
+
+  // 4f. approve mode holds lines until the owner decides
+  const { j: sAp } = await api("POST", `/api/connections/${conn.id}/share`, { expiry: "7d", mode: "approve" });
+  await api("POST", "/api/claim", { code: sAp.code, guestId: "ap" });
+  const gap = await openGuest(sAp.code, "ap");
+  await sleep(600);
+  gap.ws.send(JSON.stringify({ type: "input", data: "echo APPROVE-ME-42\n" }));
+  await sleep(1200);
+  const props = await api("GET", "/api/proposals");
+  const prop = props.j.find((p) => p.guestId === "ap");
+  check("approve-mode line held as proposal", !!prop && prop.line.includes("APPROVE-ME-42"));
+  check("held line not executed yet", !seenText(gap.seen).includes("APPROVE-ME-42"));
+  await api("POST", "/api/proposals/decide", { id: prop.id, approve: true });
+  const apOut = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(seenText(gap.seen)), 9000);
+    const iv = setInterval(() => {
+      if (seenText(gap.seen).includes("APPROVE-ME-42")) { clearTimeout(timer); clearInterval(iv); resolve(seenText(gap.seen)); }
+    }, 300);
+  });
+  check("approved line executes", apOut.includes("APPROVE-ME-42"));
+  try { gap.ws.close(); } catch {}
+
+  // 4g. transcripts record the session
+  await sleep(500);
+  const tr = await api("GET", "/api/transcripts");
+  const aliceTr = tr.j.find((t) => t.guestId === "alice");
+  check("transcript recorded", !!aliceTr);
+  if (aliceTr) {
+    const fileParam = aliceTr.file.split("/").map(encodeURIComponent).join("/");
+    const tc = await api("GET", `/api/transcripts/${fileParam}`);
+    check("transcript contains session output", !!(tc.j.content && tc.j.content.includes("hello-ROUNDTRIP-123")));
+  } else check("transcript contains session output", false);
+
+  // 4h. file transfer in and out of the sandbox
+  const up = await api("POST", "/api/files", { code: s1.code, path: "up/hello.txt", content: Buffer.from("file-bytes-123").toString("base64") });
+  check("guest upload accepted", up.j.ok === true);
+  const fl = await api("GET", `/api/files?code=${s1.code}`);
+  check("upload listed", fl.j.files.some((f) => f.path === "up/hello.txt"));
+  const dl = await fetch(BASE + `/api/files?code=${s1.code}&path=` + encodeURIComponent("up/hello.txt")).then((r) => r.text());
+  check("download matches upload", dl === "file-bytes-123");
+  const trav = await fetch(BASE + `/api/files?code=${s1.code}&path=` + encodeURIComponent("../../data.json"));
+  check("path traversal rejected", trav.status === 403);
+
+  // 4i. rename machine + notify config round-trip
+  const rn = await api("PATCH", `/api/connections/${conn.id}`, { name: "renamed-box" });
+  check("rename works", rn.j.name === "renamed-box");
+  let priorNotify = null, hadNotify = false;
+  try { priorNotify = fs.readFileSync("notify.json", "utf8"); hadNotify = true; } catch { /* none */ }
+  globalThis.__priorNotify = hadNotify ? priorNotify : null;
+  const nz = await api("POST", "/api/notify", { telegram: null, discord: null });
+  const ng = await api("GET", "/api/notify");
+  check("notify config round-trips", nz.j.ok === true && ng.j.config && ng.j.config.telegram === null);
+
+  // 4b. guest confinement (macOS seatbelt): host files unreadable, sandbox writable.
+  if (process.platform === "darwin") {
+    const cout = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(`${RELAY}?role=guest&code=${s1.code}&guestId=confinetest`);
+      let buf = "";
+      const timer = setTimeout(() => { try { ws.close(); } catch {} resolve(buf); }, 10000);
+      ws.on("open", async () => {
+        ws.send(JSON.stringify({ type: "input", data: "stty -echo\n" }));
+        await sleep(400);
+        ws.send(JSON.stringify({ type: "input", data: "ls /Users 2>&1; echo T2; touch confine-ok && echo T5; echo ZZEND\n" }));
+      });
+      ws.on("message", (raw) => {
+        try { buf += JSON.parse(raw.toString()).data || ""; } catch {}
+        // Input echo also contains ZZEND, so wait for the executed output.
+        if (buf.includes("ZZEND") && !ws._zz) { ws._zz = true; setTimeout(() => { clearTimeout(timer); try { ws.close(); } catch {} resolve(buf); }, 1200); }
+      });
+      ws.on("error", reject);
+    });
+    const flat = cout.replaceAll("\r", "").replace(/\[[0-9;?]*[a-zA-Z]/g, "");
+    check("guest cannot list /Users", /\/Users: Operation not permitted/.test(flat), flat.slice(-160));
+    check("guest can write in sandbox", /^T5$/m.test(flat));
+  }
 
   // 5. revoke isolates: revoked guest kicked, second share unaffected
   const { j: s2 } = await api("POST", `/api/connections/${conn.id}/share`, { expiry: "7d" });
@@ -155,6 +311,80 @@ try {
     fs.rmSync(path.join(".cloud", safe), { recursive: true, force: true });
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+
+  // 10. relay restart survival: same-id guest keeps their live shell
+  agent = launch("node", ["agent.js", conn.id], { RELAY });
+  await sleep(1500);
+  const surv = await openGuest(s2.code, "survivor");
+  await sleep(600);
+  surv.ws.send(JSON.stringify({ type: "input", data: "export SURVIVOR=stay-alive\n" }));
+  await sleep(800);
+  try { server?.kill(); } catch {}
+  try { surv.ws.close(); } catch {}
+  await sleep(1000);
+  server = launch("node", ["server.js"], { PORT: String(PORT), DATA_FILE: TEST_DATA });
+  await waitFor(async () => { const r = await fetch(BASE + "/api/connections"); if (!r.ok) throw new Error("not up"); }, 15000);
+  await waitFor(async () => {
+    const r = await api("POST", "/api/claim", { code: s2.code, guestId: "survivor2" });
+    if (r.j.ownerOnline !== true) throw new Error("agent not back");
+  }, 15000);
+  const surv2 = await openGuest(s2.code, "survivor");
+  await sleep(600);
+  surv2.ws.send(JSON.stringify({ type: "input", data: "echo $SURVIVOR\n" }));
+  const survOut = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(seenText(surv2.seen)), 9000);
+    const iv = setInterval(() => {
+      if (seenText(surv2.seen).includes("stay-alive")) { clearTimeout(timer); clearInterval(iv); resolve(seenText(surv2.seen)); }
+    }, 300);
+  });
+  check("shell state survives relay restart", survOut.includes("stay-alive"));
+  try { surv2.ws.close(); } catch {}
+
+  // 11. idle timeout closes forgotten shells (isolated connection)
+  const { j: idleConn } = await api("POST", "/api/connections", { name: "idle-box" });
+  const { j: idleShare } = await api("POST", `/api/connections/${idleConn.id}/share`, { expiry: "7d" });
+  await api("POST", "/api/claim", { code: idleShare.code, guestId: "sleepy" });
+  const idleAgent = launch("node", ["agent.js", idleConn.id], { RELAY, IDLE_TIMEOUT_MS: "1500" });
+  await sleep(1500);
+  const sl = await openGuest(idleShare.code, "sleepy");
+  await sleep(600);
+  const idleGone = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 8000);
+    const iv = setInterval(() => {
+      if (seenText(sl.seen).includes("idle timeout")) { clearTimeout(timer); clearInterval(iv); resolve(true); }
+    }, 300);
+  });
+  check("idle shell closes itself", idleGone);
+  sl.ws.send(JSON.stringify({ type: "input", data: "echo BACK-AGAIN\n" }));
+  const backAgain = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 8000);
+    const iv = setInterval(() => {
+      const n = (seenText(sl.seen).match(/connected to/g) || []).length;
+      if (n >= 2) { clearTimeout(timer); clearInterval(iv); resolve(true); }
+    }, 300);
+  });
+  check("next input starts a fresh shell", backAgain);
+  try { sl.ws.close(); } catch {}
+  try { idleAgent.kill(); } catch {}
+  try { fs.rmSync(path.join("sandbox", idleConn.id), { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(path.join("transcripts", idleConn.id), { recursive: true, force: true }); } catch {}
+
+  // 12. delete machine removes it, its shares and its guests
+  const { j: delConn } = await api("POST", "/api/connections", { name: "doomed" });
+  const { j: delShare } = await api("POST", `/api/connections/${delConn.id}/share`, { expiry: "7d" });
+  await api("POST", "/api/claim", { code: delShare.code, guestId: "doomed-guest" });
+  const dg = await openGuest(delShare.code, "doomed-guest");
+  await sleep(600);
+  await api("DELETE", `/api/connections/${delConn.id}`);
+  const gone = await api("GET", "/api/connections");
+  check("deleted machine gone", !gone.j.some((c) => c.id === delConn.id));
+  const reclaim = await api("POST", "/api/claim", { code: delShare.code, guestId: "x" });
+  check("deleted share unclaimable", reclaim.status === 404);
+  await sleep(600);
+  check("deleted-connection guest disconnected", dg.ws.readyState === WebSocket.CLOSED);
+  try { dg.ws.close(); } catch {}
+  try { fs.rmSync(path.join("sandbox", delConn.id), { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(path.join("transcripts", delConn.id), { recursive: true, force: true }); } catch {}
 } catch (e) {
   check("no harness exception", false, String(e));
 } finally {
@@ -163,6 +393,13 @@ try {
   try { agent?.kill(); } catch {}
   try { server?.kill(); } catch {}
   try { if (__connId) fs.rmSync(path.join("sandbox", __connId), { recursive: true, force: true }); } catch {}
+  try { if (__connId) fs.rmSync(path.join("transcripts", __connId), { recursive: true, force: true }); } catch {}
+  try {
+    if (globalThis.__priorNotify !== undefined) {
+      if (globalThis.__priorNotify) fs.writeFileSync("notify.json", globalThis.__priorNotify);
+      else fs.rmSync("notify.json", { force: true });
+    }
+  } catch {}
 }
 console.log(results.map((r) => r.join(" | ")).join("\n"));
 process.exit(process.exitCode || 0);
