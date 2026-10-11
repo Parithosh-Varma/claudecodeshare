@@ -48,22 +48,27 @@ guest browser --wss--> relay (server.js) <--wss-- agent (agent.js, on your dev m
 
 ## Quickstart
 
-One command (starts the relay if needed, reuses or creates your
-connection, runs the agent — Ctrl-C stops everything it started):
+Install once, share forever (state lives in `~/.second-seat`):
 
 ```sh
-npm install
-npm run share [-- name|connection-id] [--tunnel] [--port N] [--no-open]   # everything: relay, agents, a ready link per machine, browser opens itself
+npm i -g second-seat
+second-seat share [-- name|connection-id] [--tunnel] [--port N] [--no-open]   # relay, agents, a ready link per machine, browser opens itself
 ```
 
 Reach guests outside your network via a free Cloudflare tunnel
 (no account, no domain — URL changes each restart):
 
 ```sh
-npm run share -- --tunnel
+second-seat share -- --tunnel
 ```
 
-Or step by step:
+Brand-new machine with nothing on it? One command preps it all:
+
+```sh
+curl -fsSL https://second-seat-console.pages.dev/install.sh -o /tmp/seat-install.sh && bash /tmp/seat-install.sh
+```
+
+Or step by step (repo checkout):
 
 ```sh
 node server.js &                 # relay+UI on http://localhost:8787
@@ -94,7 +99,7 @@ machine. The sidebar's **Cloud backup** card pushes it all up:
 - Tick **auto-push new files** once and everything Claude makes from then
   on goes up by itself (survives server restarts).
 
-CLI equivalent: `npm run publish -- <owner/repo> [--connection c_...]
+CLI equivalent: `npm run backup -- <owner/repo> [--connection c_...]
 [--create] [--watch]`. Auth uses `gh` (OS keyring; PAT asked once if
 needed, never written to disk). A `.gitignore` for secrets is added
 automatically. Only your token, only your repo — a guest must never paste

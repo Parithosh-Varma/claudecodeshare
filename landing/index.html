@@ -94,7 +94,7 @@ footer .spacer{flex:1}
     <a class="btn" href="https://second-seat-console.pages.dev">Start Building</a>
     <a class="btn ghost" href="https://github.com/Parithosh-Varma/second-seat">Star on GitHub</a>
   </div>
-  <div class="cmd"><span>$ npm run share -- --tunnel</span><button onclick="navigator.clipboard.writeText('npm run share -- --tunnel')">copy</button></div>
+  <div class="cmd"><span>$ npm i -g second-seat && second-seat share -- --tunnel</span><button onclick="navigator.clipboard.writeText('npm i -g second-seat && second-seat share -- --tunnel')">copy</button></div>
   <div class="terminal" aria-label="Example shared session">
     <div class="term-bar"><i></i><i></i><i></i></div>
     <div class="term-body" id="session"></div>
@@ -106,7 +106,7 @@ footer .spacer{flex:1}
   <p class="kicker">how it works</p>
   <h2>Three moves.<br><span class="dim">Then you're sharing.</span></h2>
   <div class="steps">
-    <div class="step"><div class="n">01</div><h3>Run one command</h3><p><code>npm run share -- --tunnel</code> starts the relay, serves every connection, and opens a free public URL. No ports. No accounts to configure.</p></div>
+    <div class="step"><div class="n">01</div><h3>Run one command</h3><p><code>npm i -g second-seat</code> once, then <code>second-seat share -- --tunnel</code> starts the relay, serves every connection, and opens a free public URL. No ports. No accounts to configure.</p></div>
     <div class="step"><div class="n">02</div><h3>Send a link</h3><p>Pick an expiry — a day, a week, a month. Each share is its own revocable token. Everyone signs in; nobody sees your passwords.</p></div>
     <div class="step"><div class="n">03</div><h3>They're in your terminal</h3><p>Your guest opens the link and gets a real PTY on your box. Done with them? Revoke. They're gone instantly.</p></div>
   </div>
@@ -151,7 +151,7 @@ footer .spacer{flex:1}
 (function(){
   var reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   var lines = [
-    ['t-dim',  'sharer  $ npm run share -- --tunnel'],
+    ['t-dim',  'sharer  $ second-seat share -- --tunnel'],
     ['t-green','public URL: https://harbor-pilot-maps-try.trycloudflare.com'],
     ['t-dim',  '[agent] serving c_c2ff7e9957cd'],
     ['t-dim',  'guest   opened link  ·  claimed dev-machine as varma'],
