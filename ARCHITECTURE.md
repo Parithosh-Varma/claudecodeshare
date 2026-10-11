@@ -38,8 +38,10 @@ State lives next to the code by default (`data.json`, `sandbox/`,
 truth: `SEAT_DATA_DIR` (or `~/.second-seat` for global installs)
 redirects all of it; `DATA_FILE` still wins for `data.json` (tests).
 Checkouts stay in sync via symlinks (`public/`, `cloudflare/` point at
-the private repos); npm packing materializes the dashboard into the
-tarball via `scripts/materialize-public.js` (+ `restore-public.js`).
+the private repos). The dashboard is **not** in the npm tarball — the
+package is API-only and `postinstall` lays down `public/vendor/`, so a
+global install serves the headless relay page and points at the hosted
+console, exactly like a bare clone.
 
 ## Cloud layout (paid tier)
 

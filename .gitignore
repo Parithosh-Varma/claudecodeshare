@@ -22,6 +22,5 @@ cloudflare
 public
 
 # npm packaging litter + global-install state
-.public-materialized
 second-seat-*.tgz
 .second-seat/
