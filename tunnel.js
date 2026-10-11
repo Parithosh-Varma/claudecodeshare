@@ -4,11 +4,8 @@
 // created while it's up embed it automatically (see server publicBase).
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const TUNNEL_FILE = path.join(__dirname, ".tunnel-url");
+import { TUNNEL_FILE } from "./paths.js";
+export { TUNNEL_FILE };
 const URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 
 export function cloudflaredAvailable() {

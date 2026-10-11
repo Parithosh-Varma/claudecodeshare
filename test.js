@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
+import { PKG_ROOT, SANDBOX_ROOT } from "./paths.js";
 
 const PORT = 8788;
 const BASE = `http://localhost:${PORT}`;
@@ -38,7 +39,7 @@ const check = (name, ok, extra = "") => { results.push([ok ? "PASS" : "FAIL", na
 
 let server, agent;
 try {
-  server = launch("node", ["server.js"], { PORT: String(PORT), DATA_FILE: TEST_DATA });
+  server = launch("node", [path.join(PKG_ROOT, "server.js")], { PORT: String(PORT), DATA_FILE: TEST_DATA });
   await waitFor(async () => { const r = await fetch(BASE + "/api/connections"); if (!r.ok) throw new Error("not up"); });
 
   // 1. create connection
@@ -47,7 +48,7 @@ try {
   check("create connection", !!conn.id, conn.id || "");
 
   // 2. start owner agent
-  agent = launch("node", ["agent.js", conn.id], { RELAY });
+  agent = launch("node", [path.join(PKG_ROOT, "agent.js"), conn.id], { RELAY });
   await sleep(1200);
 
   // 3. share (long-lived) + claim
@@ -288,10 +289,10 @@ try {
     const bare = path.join(tmp, "cloud.git");
     const statusFile = path.join(tmp, "status.json");
     spawnSync("git", ["init", "--bare", bare], { stdio: "pipe" });
-    const tdir = path.join("sandbox", "t-pubtest");
+    const tdir = path.join(SANDBOX_ROOT, "t-pubtest");
     fs.mkdirSync(tdir, { recursive: true });
     fs.writeFileSync(path.join(tdir, "app.txt"), "v1\n");
-    const runPub = (extra = []) => spawnSync("node", ["publish.js", "--remote", bare, "--connection", "t-pubtest", "--no-auth", "--status-file", statusFile, ...extra], { encoding: "utf8" });
+    const runPub = (extra = []) => spawnSync("node", [path.join(PKG_ROOT, "publish.js"), "--remote", bare, "--connection", "t-pubtest", "--no-auth", "--status-file", statusFile, ...extra], { encoding: "utf8" });
     const r1 = runPub();
     const log1 = spawnSync("git", ["--git-dir", bare, "log", "--oneline"], { encoding: "utf8" }).stdout.trim().split("\n").filter(Boolean);
     check("publish pushes sandbox folder to repo", r1.status === 0 && log1.length === 1, log1.join(";") || String(r1.stderr).slice(-200));
@@ -313,7 +314,7 @@ try {
   }
 
   // 10. relay restart survival: same-id guest keeps their live shell
-  agent = launch("node", ["agent.js", conn.id], { RELAY });
+  agent = launch("node", [path.join(PKG_ROOT, "agent.js"), conn.id], { RELAY });
   await sleep(1500);
   const surv = await openGuest(s2.code, "survivor");
   await sleep(600);
@@ -322,7 +323,7 @@ try {
   try { server?.kill(); } catch {}
   try { surv.ws.close(); } catch {}
   await sleep(1000);
-  server = launch("node", ["server.js"], { PORT: String(PORT), DATA_FILE: TEST_DATA });
+  server = launch("node", [path.join(PKG_ROOT, "server.js")], { PORT: String(PORT), DATA_FILE: TEST_DATA });
   await waitFor(async () => { const r = await fetch(BASE + "/api/connections"); if (!r.ok) throw new Error("not up"); }, 15000);
   await waitFor(async () => {
     const r = await api("POST", "/api/claim", { code: s2.code, guestId: "survivor2" });
@@ -344,7 +345,7 @@ try {
   const { j: idleConn } = await api("POST", "/api/connections", { name: "idle-box" });
   const { j: idleShare } = await api("POST", `/api/connections/${idleConn.id}/share`, { expiry: "7d" });
   await api("POST", "/api/claim", { code: idleShare.code, guestId: "sleepy" });
-  const idleAgent = launch("node", ["agent.js", idleConn.id], { RELAY, IDLE_TIMEOUT_MS: "1500" });
+  const idleAgent = launch("node", [path.join(PKG_ROOT, "agent.js"), idleConn.id], { RELAY, IDLE_TIMEOUT_MS: "1500" });
   await sleep(1500);
   const sl = await openGuest(idleShare.code, "sleepy");
   await sleep(600);
@@ -366,7 +367,7 @@ try {
   check("next input starts a fresh shell", backAgain);
   try { sl.ws.close(); } catch {}
   try { idleAgent.kill(); } catch {}
-  try { fs.rmSync(path.join("sandbox", idleConn.id), { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(path.join(SANDBOX_ROOT, idleConn.id), { recursive: true, force: true }); } catch {}
   try { fs.rmSync(path.join("transcripts", idleConn.id), { recursive: true, force: true }); } catch {}
 
   // 12. delete machine removes it, its shares and its guests
@@ -383,7 +384,7 @@ try {
   await sleep(600);
   check("deleted-connection guest disconnected", dg.ws.readyState === WebSocket.CLOSED);
   try { dg.ws.close(); } catch {}
-  try { fs.rmSync(path.join("sandbox", delConn.id), { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(path.join(SANDBOX_ROOT, delConn.id), { recursive: true, force: true }); } catch {}
   try { fs.rmSync(path.join("transcripts", delConn.id), { recursive: true, force: true }); } catch {}
 } catch (e) {
   check("no harness exception", false, String(e));
@@ -392,7 +393,7 @@ try {
   try { globalThis.__ws2?.close(); } catch {}
   try { agent?.kill(); } catch {}
   try { server?.kill(); } catch {}
-  try { if (__connId) fs.rmSync(path.join("sandbox", __connId), { recursive: true, force: true }); } catch {}
+  try { if (__connId) fs.rmSync(path.join(SANDBOX_ROOT, __connId), { recursive: true, force: true }); } catch {}
   try { if (__connId) fs.rmSync(path.join("transcripts", __connId), { recursive: true, force: true }); } catch {}
   try {
     if (globalThis.__priorNotify !== undefined) {

@@ -20,3 +20,8 @@ publish-status.json
 # Local copies are symlinks there; never committed publicly.
 cloudflare
 public
+
+# npm packaging litter + global-install state
+.public-materialized
+second-seat-*.tgz
+.second-seat/

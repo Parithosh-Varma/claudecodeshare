@@ -3,12 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
+import {
+  PKG_ROOT, DATA_FILE, TUNNEL_FILE, TRANSCRIPTS_DIR, NOTIFY_FILE,
+  PUBLISH_FILE, PUBLISH_STATUS, PUBLIC_DIR, sandboxOf,
+} from "./paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8787;
-const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data.json");
 
 const EXPIRY = { "1d": 86400_000, "7d": 7 * 86400_000, "30d": 30 * 86400_000, "forever": null };
 
@@ -24,7 +25,7 @@ const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 // Behind any proxy, honor X-Forwarded-Proto for the scheme.
 function publicBase(req) {
   try {
-    const saved = fs.readFileSync(path.join(__dirname, ".tunnel-url"), "utf8").trim();
+    const saved = fs.readFileSync(TUNNEL_FILE, "utf8").trim();
     if (saved) return saved.replace(/\/+$/, "");
   } catch {}
   const proto = req.headers["x-forwarded-proto"] || "http";
@@ -57,7 +58,6 @@ function tellOwners(connectionId, obj) {
 }
 
 // Session transcripts: every relayed chunk + membership event, per guest.
-const TRANSCRIPTS_DIR = path.join(__dirname, "transcripts");
 let tlogCount = 0;
 function tlog(connectionId, code, guestId, dir, data) {
   try {
@@ -75,7 +75,6 @@ function tlog(connectionId, code, guestId, dir, data) {
 }
 
 // Join notifications (Telegram / Discord), fire-and-forget.
-const NOTIFY_FILE = path.join(__dirname, "notify.json");
 const loadNotify = () => { try { return JSON.parse(fs.readFileSync(NOTIFY_FILE, "utf8")); } catch { return { telegram: null, discord: null }; } };
 function sendNotify(text) {
   const cfg = loadNotify();
@@ -125,7 +124,6 @@ function ensurePending(code, guestId, connectionId) {
 }
 
 // File transfer, rooted at a connection's sandbox (traversal-proof).
-const sandboxOf = (cid) => path.join(__dirname, "sandbox", cid);
 function sandboxPath(cid, p) {
   if (!p || typeof p !== "string" || p.length > 512) return null;
   if (p.split("/").includes("..")) return null; // reject escapes outright (403), not just neutralize
@@ -214,6 +212,7 @@ const server = http.createServer((req, res) => {
         mode: shareMode(s),
         active: isActive(s),
         connectionName: db.connections[s.connectionId]?.name ?? "(deleted)",
+        link: `${publicBase(req)}/?connect=${s.code}`,
       }));
       return json(200, list);
     }
@@ -487,9 +486,9 @@ const server = http.createServer((req, res) => {
     // Cloud backup preview: folder -> files that "Push to GitHub" would upload.
     if (req.method === "POST" && u.pathname === "/api/publish/preview") {
       const b = await body();
-      const argv = ["publish.js", "--preview", "--no-auth"];
+      const argv = [path.join(PKG_ROOT, "publish.js"), "--preview", "--no-auth"];
       if (b.connection) argv.push("--connection", b.connection);
-      const r = spawnSync(process.execPath, argv, { cwd: __dirname, encoding: "utf8" });
+      const r = spawnSync(process.execPath, argv, { encoding: "utf8" });
       try { return json(200, { folders: JSON.parse(r.stdout || "[]") }); }
       catch { return json(500, { error: "preview failed" }); }
     }
@@ -506,14 +505,15 @@ const server = http.createServer((req, res) => {
         return json(200, { ok: true, watching: true, output: `auto-push on -> ${cfg.repo || cfg.remote}` });
       }
       stopPublishWatcher();
-      const argv = ["publish.js", ...target, "--branch", cfg.branch, ...(b.create ? ["--create"] : []), "--status-file", PUBLISH_STATUS];
-      const r = spawnSync(process.execPath, argv, { cwd: __dirname, encoding: "utf8" });
+      const argv = [path.join(PKG_ROOT, "publish.js"), ...target, "--branch", cfg.branch, ...(b.create ? ["--create"] : []), "--status-file", PUBLISH_STATUS];
+      const r = spawnSync(process.execPath, argv, { encoding: "utf8" });
       const output = ((r.stdout || "") + (r.stderr || "")).trim().slice(-2000);
       return json(200, { ok: r.status === 0, output });
     }
-    // Static frontend
+    // Static frontend (ships in the private dashboard package; global npm
+    // installs are headless — API works, UI points at the hosted console)
     let f = u.pathname === "/" ? "/index.html" : u.pathname;
-    const fp = path.join(__dirname, "public", path.normalize(f).replace(/^\/+/, ""));
+    const fp = path.join(PUBLIC_DIR, path.normalize(f).replace(/^\/+/, ""));
     if (req.method === "GET" && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
       const ext = path.extname(fp);
       const ctype = ext === ".html" ? "text/html"
@@ -522,6 +522,10 @@ const server = http.createServer((req, res) => {
         : ext === ".json" ? "application/json" : "text/plain";
       res.writeHead(200, { "Content-Type": ctype });
       return res.end(fs.readFileSync(fp));
+    }
+    if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/index.html")) {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      return res.end(`<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Second Seat relay</title><body style="font-family:system-ui;max-width:560px;margin:4rem auto;padding:0 1.5rem"><h1>Second Seat relay is running.</h1><p>This install ships without the dashboard UI &mdash; use the <a href="https://second-seat-console.pages.dev">hosted console</a>, or point any dashboard at this relay (<code>${u.host || ""}</code>).</p><p>API: <code>GET /api/connections</code> &middot; share via <code>POST /api/connections/:id/share</code></p></body>`);
     }
     return json(404, { error: "not found" });
   })().catch((e) => json(500, { error: String(e) }));
@@ -533,8 +537,6 @@ const owners = new Map(); // connectionId -> Set<ws>
 const guests = new Map(); // code -> Set<ws>
 
 // ---- cloud backup watcher (auto-pushes new sandbox files) ----
-const PUBLISH_FILE = path.join(__dirname, "publish.json");
-const PUBLISH_STATUS = path.join(__dirname, "publish-status.json");
 let publishWatcher = null;
 function loadPublishConfig() {
   try { return JSON.parse(fs.readFileSync(PUBLISH_FILE, "utf8")); } catch { return null; }
@@ -548,8 +550,8 @@ function stopPublishWatcher() {
 function startPublishWatcher(cfg) {
   stopPublishWatcher();
   const target = cfg.remote ? ["--remote", cfg.remote] : [cfg.repo];
-  const argv = ["publish.js", ...target, "--branch", cfg.branch || "main", "--watch", "--interval", "30", "--status-file", PUBLISH_STATUS];
-  publishWatcher = spawn(process.execPath, argv, { cwd: __dirname, stdio: ["ignore", "pipe", "pipe"] });
+  const argv = [path.join(PKG_ROOT, "publish.js"), ...target, "--branch", cfg.branch || "main", "--watch", "--interval", "30", "--status-file", PUBLISH_STATUS];
+  publishWatcher = spawn(process.execPath, argv, { stdio: ["ignore", "pipe", "pipe"] });
   publishWatcher.stdout.on("data", (d) => process.stdout.write("[publish] " + d));
   publishWatcher.stderr.on("data", (d) => process.stderr.write("[publish] " + d));
   publishWatcher.on("exit", () => { publishWatcher = null; });

@@ -4,11 +4,10 @@
 // opencode / claude code render correctly); revoke/expiry kills only that PTY.
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import * as pty from "node-pty";
+import { sandboxOf } from "./paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RELAY = process.env.RELAY || "ws://localhost:8787/relay";
 // Cloud relay requires the owner token (wrangler secret put OWNER_TOKEN).
 // Local node relay ignores the extra query param.
@@ -42,7 +41,7 @@ function resolveShell() {
   return "sh";
 }
 
-const sandbox = path.join(__dirname, "sandbox", CONNECTION_ID);
+const sandbox = sandboxOf(CONNECTION_ID);
 fs.mkdirSync(sandbox, { recursive: true });
 const guestTmp = path.join(sandbox, ".tmp");
 fs.mkdirSync(guestTmp, { recursive: true });

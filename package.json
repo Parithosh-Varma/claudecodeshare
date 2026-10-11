@@ -1,8 +1,39 @@
 {
   "name": "second-seat",
   "version": "0.2.0",
-  "description": "Minimal PandaNpc-style shareable terminal relay: revocable, expiring share links",
+  "description": "Share your machine, keep your keys: revocable, expiring share links to a live terminal on your dev box",
   "type": "module",
+  "bin": {
+    "second-seat": "./bin/second-seat.js"
+  },
+  "files": [
+    "bin/",
+    "agent.js",
+    "server.js",
+    "share.js",
+    "publish.js",
+    "tunnel.js",
+    "paths.js",
+    "test.js",
+    "README.md",
+    "ARCHITECTURE.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "second-seat": "./bin/second-seat.js"
+  },
+  "files": [
+    "bin/",
+    "paths.js",
+    "server.js",
+    "agent.js",
+    "share.js",
+    "tunnel.js",
+    "publish.js",
+    "public/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node server.js",
     "agent": "node agent.js",
@@ -10,6 +41,8 @@
     "publish": "node publish.js",
     "test": "node test.js",
     "postinstall": "mkdir -p public/vendor && cp node_modules/xterm/lib/xterm.js node_modules/xterm/css/xterm.css node_modules/@xterm/addon-fit/lib/addon-fit.js public/vendor/ 2>/dev/null; chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null; true",
+    "prepack": "node scripts/materialize-public.js",
+    "postpack": "node scripts/restore-public.js",
     "deploy": "wrangler deploy",
     "preview": "wrangler dev"
   },

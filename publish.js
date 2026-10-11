@@ -17,9 +17,8 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
+import { DATA_FILE, SANDBOX_ROOT, CLOUD_ROOT } from "./paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 const flag = (n, d) => {
   const i = args.indexOf(n);
@@ -93,7 +92,7 @@ if (!PREVIEW && !NO_AUTH && GH_ENV === null) {
 const me = (NO_AUTH || PREVIEW) ? "second-seat" : (gh(["api", "user", "-q", ".login"]).stdout.trim() || "second-seat");
 
 // ---- sandboxes to back up ----
-const sandboxRoot = path.join(__dirname, "sandbox");
+const sandboxRoot = SANDBOX_ROOT;
 let sandboxes = [];
 if (CONNECTION) {
   const d = path.join(sandboxRoot, CONNECTION);
@@ -109,7 +108,7 @@ if (sandboxes.length === 0) { console.error("nothing to back up"); process.exit(
 
 // ---- staging clone (the single cloud folder) ----
 const stagingName = ((REPO || REMOTE_ARG || "preview").replace(/[^A-Za-z0-9_.-]+/g, "_")).slice(0, 80);
-const cloudRoot = path.join(__dirname, ".cloud");
+const cloudRoot = CLOUD_ROOT;
 const staging = path.join(cloudRoot, stagingName);
 fs.mkdirSync(cloudRoot, { recursive: true });
 
@@ -149,7 +148,7 @@ function ensureStaging() {
 // (display names come from data.json; falls back to the raw id).
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "session";
 let connNames = {};
-try { connNames = JSON.parse(fs.readFileSync(path.join(__dirname, "data.json"), "utf8")).connections || {}; } catch {}
+try { connNames = JSON.parse(fs.readFileSync(DATA_FILE, "utf8")).connections || {}; } catch {}
 const folderFor = (id) => `${slug(connNames[id]?.name || id)}-${id.replace(/^c_/, "").slice(0, 6)}`;
 for (const s of sandboxes) s.folder = folderFor(s.id);
 const notGit = (src) => {

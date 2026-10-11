@@ -1,8 +1,12 @@
 // Second Seat rich CLI: one command starts everything.
-// Usage: npm run share [-- name|connection-id] [--tunnel] [--port N]
+// Usage: npm run share [-- name|connection-id] [--tunnel] [--port N] [--no-open]
 //   no arg      share every connection (creates dev-machine if none)
 //   --tunnel    expose via Cloudflare quick tunnel (guests outside your LAN)
+//   --no-open   don't auto-open the browser
+// One run = relay + agents + a ready-to-send link per connection + browser open.
 import { spawn } from "node:child_process";
+import path from "node:path";
+import { PKG_ROOT } from "./paths.js";
 import chalk from "chalk";
 import ora from "ora";
 import boxen from "boxen";
@@ -47,7 +51,7 @@ let childServer = null;
     spin.succeed(`Relay already running on ${dim(`:${PORT}`)}`);
   } else {
     spin.text = `Starting relay on :${PORT}`;
-    childServer = spawn("node", ["server.js"], {
+    childServer = spawn(process.execPath, [path.join(PKG_ROOT, "server.js")], {
       env: { ...process.env, PORT: String(PORT) },
       stdio: ["ignore", "ignore", "inherit"],
       detached: true,
@@ -133,7 +137,7 @@ const agents = new Map(); // connId -> child
 let shuttingDown = false, boardTimer = null;
 function startAgent(conn) {
   if (shuttingDown || agents.has(conn.id)) return;
-  const a = spawn("node", ["agent.js", conn.id], { stdio: "inherit" });
+  const a = spawn(process.execPath, [path.join(PKG_ROOT, "agent.js"), conn.id], { stdio: "inherit" });
   agents.set(conn.id, a);
   a.on("exit", (code) => {
     agents.delete(conn.id);
@@ -144,7 +148,39 @@ function startAgent(conn) {
   });
 }
 for (const conn of targets) startAgent(conn);
+
+// ---- magic: every served connection gets a sendable link, browser opens ----
+async function ensureLinks() {
+  let shares = [];
+  try { shares = await api("GET", "/api/shares"); } catch { return; }
+  for (const conn of targets) {
+    const active = shares.filter((s) => s.connectionId === conn.id && s.active);
+    if (active.length) {
+      const s = active[0];
+      const link = s.link || `${publicBase}/?connect=${s.code}`;
+      console.log(`${ok} share link ready: ${chalk.bold(link)} ${dim(`(${conn.name}, ${s.mode || "full"}) — send it to your guest`)}`);
+    } else {
+      try {
+        const s = await api("POST", `/api/connections/${conn.id}/share`, { expiry: "7d" });
+        const link = s.link || `${publicBase}/?connect=${s.code}`;
+        console.log(`${ok} created 7-day link: ${chalk.bold(link)} ${dim(`(${conn.name}) — send it to your guest`)}`);
+      } catch (e) { console.log(warn, `could not create link for ${conn.id}: ${e.message}`); }
+    }
+  }
+}
+function openBrowser(url) {
+  if (ARGS.includes("--no-open") || !process.stdout.isTTY) return;
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  try {
+    const c = spawn(cmd, args, { stdio: "ignore", detached: true });
+    c.unref();
+    console.log(dim(`opened ${url} in your browser`));
+  } catch {}
+}
+await ensureLinks();
 await printBoard();
+openBrowser(publicBase + "/");
 
 // Pick up connections created after startup (e.g. via the dashboard's
 // "+ New" button) so `npm run share` keeps serving everything.
@@ -152,10 +188,12 @@ let lastSig = "";
 async function refreshBoard() {
   try {
     const conns = await api("GET", "/api/connections");
+    let shares = [];
+    try { shares = await api("GET", "/api/shares"); } catch {}
     const wanted = WANT && WANT.startsWith("c_")
       ? conns.filter((c) => c.id === WANT)
       : WANT ? conns.filter((c) => c.name === WANT) : conns;
-    const sig = wanted.map((c) => c.id).sort().join(",") + "|" + [...agents.keys()].sort().join(",");
+    const sig = wanted.map((c) => c.id).sort().join(",") + "|" + [...agents.keys()].sort().join(",") + "|" + shares.filter((s) => s.active).map((s) => s.code).sort().join(",");
     if (sig !== lastSig) {
       lastSig = sig;
       targets = wanted;
