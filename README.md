@@ -53,7 +53,7 @@ connection, runs the agent — Ctrl-C stops everything it started):
 
 ```sh
 npm install
-npm run share [-- name|connection-id]   # no arg = share every connection
+npm run share [-- name|connection-id] [--tunnel] [--port N]   # rich status board; no arg = every connection
 ```
 
 Reach guests outside your network via a free Cloudflare tunnel
