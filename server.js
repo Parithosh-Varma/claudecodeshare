@@ -111,8 +111,12 @@ const server = http.createServer((req, res) => {
     let f = u.pathname === "/" ? "/index.html" : u.pathname;
     const fp = path.join(__dirname, "public", path.normalize(f).replace(/^\/+/, ""));
     if (req.method === "GET" && fs.existsSync(fp) && fs.statSync(fp).isFile()) {
-      const ext = path.extname(fp) === ".html" ? "text/html" : "text/plain";
-      res.writeHead(200, { "Content-Type": ext });
+      const ext = path.extname(fp);
+      const ctype = ext === ".html" ? "text/html"
+        : ext === ".js" ? "application/javascript"
+        : ext === ".css" ? "text/css"
+        : ext === ".json" ? "application/json" : "text/plain";
+      res.writeHead(200, { "Content-Type": ctype });
       return res.end(fs.readFileSync(fp));
     }
     return json(404, { error: "not found" });
@@ -181,9 +185,10 @@ wss.on("connection", (ws, req) => {
         try { ws.send(JSON.stringify({ type: "revoked" })); } catch {}
         return ws.close(4403, "revoked-or-expired");
       }
+      if (m.type !== "input" && m.type !== "resize" && m.type !== "connect") return;
       for (const o of targets())
         if (o.readyState === 1)
-          o.send(JSON.stringify({ type: "input", from: ws._guestId, code, data: m.data }));
+          o.send(JSON.stringify({ type: m.type, from: ws._guestId, code, data: m.data, cols: m.cols, rows: m.rows }));
     });
     const notifyOwner = (type) => {
       for (const o of targets())

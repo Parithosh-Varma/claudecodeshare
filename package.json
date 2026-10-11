@@ -1,14 +1,18 @@
 {
   "name": "claudecodeshare",
-  "version": "0.1.0",
-  "description": "Minimal PandaNpc-style shareable Claude Code relay: revocable, expiring share links",
+  "version": "0.2.0",
+  "description": "Minimal PandaNpc-style shareable terminal relay: revocable, expiring share links",
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "agent": "node agent.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "postinstall": "mkdir -p public/vendor && cp node_modules/xterm/lib/xterm.js node_modules/xterm/css/xterm.css node_modules/@xterm/addon-fit/lib/addon-fit.js public/vendor/ 2>/dev/null; chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null; true"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "@xterm/addon-fit": "^0.8.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0",
+    "xterm": "^5.5.0"
   }
 }
