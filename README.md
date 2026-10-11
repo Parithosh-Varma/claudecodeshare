@@ -28,8 +28,17 @@ guest browser --wss--> relay (server.js) <--wss-- agent (agent.js, on your dev m
 
 ## Quickstart
 
+One command (starts the relay if needed, reuses or creates your
+connection, runs the agent — Ctrl-C stops everything it started):
+
 ```sh
 npm install
+npm run share -- [name]
+```
+
+Or step by step:
+
+```sh
 node server.js &                 # relay+UI on http://localhost:8787
 curl -X POST localhost:8787/api/connections -H 'Content-Type: application/json' -d '{"name":"dev-machine"}'
 # -> {"id":"c_..."}
