@@ -127,6 +127,13 @@ function guestEnv() {
   }
   env.HOME = sandbox;
   env.ZDOTDIR = sandbox;
+  // opencode walks up from cwd looking for a project root before it starts,
+  // lstat-ing (and needing read access to) every ancestor directory. Seatbelt
+  // only grants ancestors metadata, so that walk dies with EPERM and every
+  // opencode command 500s. Disable the walk: guests keep global config from
+  // HOME and their own auth; only per-project opencode.json lookup is lost.
+  // (Other tools do this discovery lazily and are unaffected either way.)
+  env.OPENCODE_CONFIG_PROJECT_DISABLE = "1";
   env.HISTFILE = path.join(sandbox, ".zsh_history");
   env.TMPDIR = guestTmp + "/";
   env.TERM = "xterm-256color";
