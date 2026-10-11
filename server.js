@@ -7,7 +7,7 @@ import { WebSocketServer } from "ws";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 8787;
-const DATA_FILE = path.join(__dirname, "data.json");
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, "data.json");
 
 const EXPIRY = { "1d": 86400_000, "7d": 7 * 86400_000, "30d": 30 * 86400_000, "forever": null };
 
@@ -53,11 +53,12 @@ const server = http.createServer((req, res) => {
       save();
       return json(200, db.connections[id]);
     }
-    // List connections (with Shared badge state)
+    // List connections (with Shared badge state + agent presence)
     if (req.method === "GET" && u.pathname === "/api/connections") {
       const list = Object.values(db.connections).map((c) => ({
         ...c,
         shared: Object.values(db.shares).some((s) => s.connectionId === c.id && isActive(s)),
+        ownerOnline: (owners.get(c.id)?.size ?? 0) > 0,
       }));
       return json(200, list);
     }
@@ -105,7 +106,7 @@ const server = http.createServer((req, res) => {
       s.claims += 1;
       save();
       const c = db.connections[s.connectionId];
-      return json(200, { connectionId: s.connectionId, connectionName: c?.name, expiresAt: s.expiresAt });
+      return json(200, { connectionId: s.connectionId, connectionName: c?.name, expiresAt: s.expiresAt, ownerOnline: (owners.get(s.connectionId)?.size ?? 0) > 0 });
     }
     // Static frontend
     let f = u.pathname === "/" ? "/index.html" : u.pathname;
@@ -127,6 +128,14 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server, path: "/relay" });
 const owners = new Map(); // connectionId -> Set<ws>
 const guests = new Map(); // code -> Set<ws>
+
+function guestsOfConnection(cid) {
+  const out = [];
+  for (const set of guests.values())
+    for (const g of set)
+      if (g._connectionId === cid && g.readyState === 1) out.push(g);
+  return out;
+}
 
 function disconnectGuestsByCode(code, wsCode, reason) {
   for (const ws of guests.get(code) ?? []) {
@@ -151,7 +160,11 @@ wss.on("connection", (ws, req) => {
     if (!db.connections[cid]) return ws.close(4404, "no such connection");
     ws._role = "owner"; ws._connectionId = cid;
     if (!owners.has(cid)) owners.set(cid, new Set());
+    const wasOffline = owners.get(cid).size === 0;
     owners.get(cid).add(ws);
+    if (wasOffline)
+      for (const g of guestsOfConnection(cid))
+        try { g.send(JSON.stringify({ type: "owner-online" })); } catch {}
     ws.on("message", (raw) => {
       // owner -> specific guest: {type:'output'|'exit', to, data}
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
@@ -160,7 +173,12 @@ wss.on("connection", (ws, req) => {
           if (g._guestId === m.to && g._connectionId === cid && g.readyState === 1)
             g.send(JSON.stringify({ type: m.type, data: m.data }));
     });
-    ws.on("close", () => owners.get(cid)?.delete(ws));
+    ws.on("close", () => {
+      owners.get(cid)?.delete(ws);
+      if ((owners.get(cid)?.size ?? 0) === 0)
+        for (const g of guestsOfConnection(cid))
+          try { g.send(JSON.stringify({ type: "owner-offline" })); } catch {}
+    });
     ws.send(JSON.stringify({ type: "ready", id: ws._id }));
     return;
   }

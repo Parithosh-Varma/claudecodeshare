@@ -1,11 +1,16 @@
 // Lifecycle test: share -> claim -> exec -> revoke isolates -> expiry rejected.
 // Spawns server + agent on a test port, no external services.
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import WebSocket from "ws";
 
 const PORT = 8788;
 const BASE = `http://localhost:${PORT}`;
 const RELAY = `ws://localhost:${PORT}/relay`;
+// Isolated store so tests never touch the real data.json
+const TEST_DATA = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ccshare-")), "data.json");
 const api = (m, p, b) => fetch(BASE + p, {
   method: m, headers: { "Content-Type": "application/json" },
   body: b ? JSON.stringify(b) : undefined,
@@ -32,7 +37,7 @@ const check = (name, ok, extra = "") => { results.push([ok ? "PASS" : "FAIL", na
 
 let server, agent;
 try {
-  server = launch("node", ["server.js"], { PORT: String(PORT) });
+  server = launch("node", ["server.js"], { PORT: String(PORT), DATA_FILE: TEST_DATA });
   await waitFor(async () => { const r = await fetch(BASE + "/api/connections"); if (!r.ok) throw new Error("not up"); });
 
   // 1. create connection
@@ -48,6 +53,7 @@ try {
   check("share generates code+link", !!s1.code && !!s1.link, s1.code || "");
   const c1 = await api("POST", "/api/claim", { code: s1.code, guestId: "alice" });
   check("claim valid code", c1.status === 200, JSON.stringify(c1.j));
+  check("claim reports agent online", c1.j.ownerOnline === true, JSON.stringify(c1.j));
 
   // 4. guest exec round-trip through owner agent
   const out = await new Promise((resolve, reject) => {
@@ -95,6 +101,22 @@ try {
   // 7. invalid code rejected
   const bad = await api("POST", "/api/claim", { code: "nope123", guestId: "x" });
   check("invalid code rejected", bad.status === 404);
+
+  // 8. agent presence: killing the agent flags offline + notifies guests
+  const watcher = new WebSocket(`${RELAY}?role=guest&code=${s2.code}&guestId=watcher`);
+  await new Promise((r) => watcher.on("open", r));
+  const offlineNotice = new Promise((resolve) => {
+    watcher.on("message", (raw) => {
+      try { if (JSON.parse(raw.toString()).type === "owner-offline") resolve(true); } catch {}
+    });
+    setTimeout(() => resolve(false), 6000);
+  });
+  try { agent?.kill(); agent = null; } catch {}
+  check("guest notified when agent goes offline", await offlineNotice);
+  await sleep(400);
+  const afterKill = await api("POST", "/api/claim", { code: s2.code, guestId: "zoe" });
+  check("claim reports agent offline", afterKill.status === 200 && afterKill.j.ownerOnline === false, JSON.stringify(afterKill.j));
+  try { watcher.close(); } catch {}
 } catch (e) {
   check("no harness exception", false, String(e));
 } finally {
