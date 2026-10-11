@@ -53,6 +53,22 @@ Run the lifecycle test (share → claim → exec → revoke-isolation → expiry
 npm test
 ```
 
+## Publishing sandbox files to GitHub
+
+Whatever a session produces (e.g. files Claude wrote) lives in
+`sandbox/<connection-id>/` on your machine. To push it to GitHub:
+
+```sh
+npm run publish -- <owner/repo> [--connection c_...] [--create] [--watch]
+```
+
+- One-shot by default; `--watch` keeps polling and pushes new checkpoints.
+- Auth uses `gh` (OS keyring). If `gh` isn't logged in, you'll be asked
+  for a PAT once — it's piped to `gh`, never written to disk.
+- A `.gitignore` for secrets (`.env`, `*.pem`, …) is added automatically.
+- Only publish with a token **you** created, to a repo **you** own. A guest
+  must never paste their PAT into someone else's shared machine.
+
 ## API
 
 - `POST /api/connections {name}` → `{id}`
