@@ -10,6 +10,9 @@ import * as pty from "node-pty";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RELAY = process.env.RELAY || "ws://localhost:8787/relay";
+// Cloud relay requires the owner token (wrangler secret put OWNER_TOKEN).
+// Local node relay ignores the extra query param.
+const OWNER_TOKEN = process.env.OWNER_TOKEN || "";
 const CONNECTION_ID = process.env.CONNECTION_ID || process.argv[2];
 if (!CONNECTION_ID) {
   console.error("usage: CONNECTION_ID=xxx node agent.js  (or node agent.js <connectionId>)");
@@ -52,7 +55,7 @@ if (process.platform === "darwin") {
   try {
     fs.accessSync(zshrc);
   } catch {
-    fs.writeFileSync(zshrc, `# Created by claudecodeshare: neutral guest identity.
+    fs.writeFileSync(zshrc, `# Created by Second Seat: neutral guest identity.
 # ~ below is the shared folder (HOME is remapped), not the host's home.
 precmd_functions=()
 chpwd_functions=()
@@ -207,7 +210,7 @@ setInterval(() => {
 
 let backoffAttempts = 0;
 function connect() {
-  const ws = new WebSocket(`${RELAY}?role=owner&connectionId=${CONNECTION_ID}`);
+  const ws = new WebSocket(`${RELAY}?role=owner&connectionId=${CONNECTION_ID}${OWNER_TOKEN ? `&token=${encodeURIComponent(OWNER_TOKEN)}` : ""}`);
   ws.on("open", () => {
     currentWs = ws;
     backoffAttempts = 0;

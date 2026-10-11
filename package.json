@@ -1,5 +1,5 @@
 {
-  "name": "claudecodeshare",
+  "name": "second-seat",
   "version": "0.2.0",
   "description": "Minimal PandaNpc-style shareable terminal relay: revocable, expiring share links",
   "type": "module",
@@ -9,12 +9,17 @@
     "share": "node share.js",
     "publish": "node publish.js",
     "test": "node test.js",
-    "postinstall": "mkdir -p public/vendor && cp node_modules/xterm/lib/xterm.js node_modules/xterm/css/xterm.css node_modules/@xterm/addon-fit/lib/addon-fit.js public/vendor/ 2>/dev/null; chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null; true"
+    "postinstall": "mkdir -p public/vendor && cp node_modules/xterm/lib/xterm.js node_modules/xterm/css/xterm.css node_modules/@xterm/addon-fit/lib/addon-fit.js public/vendor/ 2>/dev/null; chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null; true",
+    "deploy": "wrangler deploy",
+    "preview": "wrangler dev"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",
     "node-pty": "^1.1.0",
     "ws": "^8.18.0",
     "xterm": "^5.3.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.149.0"
   }
 }

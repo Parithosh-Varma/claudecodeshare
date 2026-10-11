@@ -476,7 +476,7 @@ const server = http.createServer((req, res) => {
     if (req.method === "POST" && u.pathname === "/api/notify/test") {
       const cfg = loadNotify();
       if (!cfg.telegram && !cfg.discord) return json(200, { ok: false, error: "no channels configured" });
-      sendNotify("✅ test from claudecodeshare — notifications are on");
+      sendNotify("✅ test from Second Seat — notifications are on");
       return json(200, { ok: true });
     }
     // Cloud backup status (repo config + last sync + suggested private repo)

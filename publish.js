@@ -90,7 +90,7 @@ if (!PREVIEW && !NO_AUTH && GH_ENV === null) {
   if (r.status !== 0 || !ghStatus(GH_ENV)) { console.error("GitHub login failed"); process.exit(1); }
   console.log("logged in via gh (token kept in OS keyring, not on disk)");
 }
-const me = (NO_AUTH || PREVIEW) ? "claudecodeshare" : (gh(["api", "user", "-q", ".login"]).stdout.trim() || "claudecodeshare");
+const me = (NO_AUTH || PREVIEW) ? "second-seat" : (gh(["api", "user", "-q", ".login"]).stdout.trim() || "second-seat");
 
 // ---- sandboxes to back up ----
 const sandboxRoot = path.join(__dirname, "sandbox");
